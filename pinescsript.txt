@@ -161,7 +161,7 @@ riskPercent = input.float(0.5, "Risk Per Trade (%)", minval = 0.1, maxval = 10, 
 
 useSession = input.bool(false, "Skip Quiet Tokyo Hours (02:00-07:00 UTC)", group = groupStrategy, tooltip = "Signals from 02:00 to 07:00 UTC (11:00-16:00 Tokyo) still print but are not traded. Replayed on Feb - Sep 2026 XAUUSD 15m, the Tokyo open (00:00-02:00 UTC) was the strongest window of the day (profit factor 1.75), while the rest of the Tokyo session lost in both halves of the test (profit factor 0.78). Skipping it raised the total from +31R to +37R and cut the worst drawdown from 15R to 10R.")
 
-volFilter = input.bool(true, "Volatility Filter", group = groupStrategy, tooltip = "Only trades signals while volatility (ATR) is in the middle of its recent range: above the Min and below the Max percentile of the last 500 bars. The quietest stretches produce drifting signals and the wildest ones produce whipsaws. On Feb - Sep 2026 XAUUSD 15m, checked on the real data and on four copies with every candle randomly shifted to mimic another broker's feed: profit factor 1.23 -> 1.67, worst drawdown 16% -> 9%, similar total return from about 40% of the trades. Bands from 25-65 to 30-70 all worked.")
+volFilter = input.bool(true, "Volatility Filter", group = groupStrategy, tooltip = "Only trades signals while volatility is in the middle of its recent range: the average close-to-close move of the last 20 bars must rank between the Min and Max percentile of the last 500 bars. The quietest stretches produce drifting signals and the wildest ones whipsaws. It is measured from closes, not ATR, because rollover spread spikes distort highs and lows on broker feeds. Checked on Feb - Sep 2026 XAUUSD 15m, on four copies with random candle noise, and on the OANDA trade list of this strategy: your unfiltered trades inside the band made +54R (profit factor 1.98), those outside lost 20R.")
 
 volMinPct = input.int(30, "Min Volatility Percentile", minval = 0, maxval = 100, group = groupStrategy)
 
@@ -3726,11 +3726,21 @@ bool  riskFits = not propRules or (dayLossPct + newTradeRiskPct <= dailyLimitPct
 
 inTradeSession = not useSession or na(time(timeframe.period, "0200-0700", "UTC"))
 
-// Where the current ATR sits among the last 500 bars; filled in during warm-up.
+// Volatility from closes only: the average close-to-close move over 20 bars, ranked
 
-float atrPct = ta.percentrank(atr, 500)
+// against the last 500 bars. ATR was tried first but it is built from highs and lows,
 
-bool  volOk  = not volFilter or na(atrPct) or (atrPct >= volMinPct and atrPct < volMaxPct)
+// and a broker's spread spikes around the daily rollover inflate the wicks - on OANDA
+
+// that pushed the Tokyo-open hours above the band and threw away the best trades.
+
+// Closes are not affected by those wicks. Allowed through while the rank warms up.
+
+float closeVol = ta.rma(math.abs(ta.change(close)), 20)
+
+float volPct   = ta.percentrank(closeVol, 500)
+
+bool  volOk    = not volFilter or na(volPct) or (volPct >= volMinPct and volPct < volMaxPct)
 
 canEnter = inTradeSession and volOk and not nearNews and not nearClose and not limitHit and riskFits
 
