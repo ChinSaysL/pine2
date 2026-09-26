@@ -155,6 +155,8 @@ exitOnFilteredFlip = input.bool(true, "Exit On Filtered Opposite Signal", group 
 
 riskPercent = input.float(1.0, "Risk Per Trade (%)", minval = 0.1, maxval = 10, step = 0.1, group = groupStrategy, tooltip = "Every trade is sized so that hitting its stop loses this share of the current equity. The stop is the trailing stop line behind the signals at the moment of entry (the level whose break flips the signal), or the TP/SL stop when TP/SL Points is On. Size = equity x risk / (stop distance x point value).")
 
+useSession = input.bool(false, "Only Trade 06:00-17:00 UTC", group = groupStrategy, tooltip = "Signals outside London and early New York hours still print but are not traded. On Feb - Sep 2026 XAUUSD 15m it halved the drawdown and raised the profit factor from 1.18 to 1.27, but it also skipped the profitable Asian-open trades, so total profit was lower (+20R vs +31R). Test it on your own history before relying on it.")
+
 
 
 if (signalPresets == "Trend Trader [Preset]")
@@ -3547,6 +3549,10 @@ flipAgainst = tradeDir == 1 ? (sellSignal or (exitOnFilteredFlip and os < os[1])
 
 
 
+// Signals are only traded inside the session when that filter is on.
+
+inTradeSession = not useSession or not na(time(timeframe.period, "0600-1700", "UTC"))
+
 exitReason = tpWarnHit ? "TP Warning" : profitLockHit ? "Profit Lock" : flipAgainst ? "Signal Flip" : ""
 
 
@@ -3555,7 +3561,7 @@ if tradeDir != 0 and exitReason != ""
 
     bool exitLong  = tradeDir == 1
 
-    bool reversing = exitLong ? sellSignal : buySignal
+    bool reversing = (exitLong ? sellSignal : buySignal) and inTradeSession
 
     // On a reversal the opposite entry below closes this trade itself. Closing it here
 
@@ -3623,7 +3629,7 @@ float riskTakenPct = riskQty * entryStopDist * syminfo.pointvalue / strategy.equ
 
 
 
-if buySignal and tradeDir != 1
+if buySignal and tradeDir != 1 and inTradeSession
 
     strategy.entry("Long", strategy.long, qty = riskQty, comment = "Buy")
 
@@ -3657,7 +3663,7 @@ if buySignal and tradeDir != 1
 
 
 
-if sellSignal and tradeDir != -1
+if sellSignal and tradeDir != -1 and inTradeSession
 
     strategy.entry("Short", strategy.short, qty = riskQty, comment = "Sell")
 
