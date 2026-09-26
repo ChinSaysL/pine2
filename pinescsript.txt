@@ -143,7 +143,13 @@ tpWarnEverySignal = input.bool(false, "Show Best Exit In Hindsight (review only)
 
 groupStrategy = "STRATEGY EXITS"
 
-profitLockAtr = input.float(1.0, "Profit Lock (ATR)", minval = 0, step = 0.25, group = groupStrategy, tooltip = "Once a trade has run this many ATR in its favour, giving back half of that run takes the profit with the yellow TAKE PROFIT label. Catches trades that turn round without printing one of the reversal events the take profit warning looks for. 0 switches it off.")
+tpMinR = input.float(0.5, "Take Profit Min Profit (R)", minval = 0, step = 0.25, group = groupStrategy, tooltip = "The yellow take profit warning only closes the trade once it is at least this many R in profit (1R = entry to initial stop). Needs Only Warn When In Profit on.")
+
+breakevenR = input.float(1.5, "Breakeven At (R)", minval = 0, step = 0.25, group = groupStrategy, tooltip = "Moves the stop to the entry once the trade has closed this many R in profit. 0 switches it off.")
+
+profitLockR = input.float(2.0, "Profit Lock Start (R)", minval = 0, step = 0.25, group = groupStrategy, tooltip = "Once a trade has closed this many R in profit, giving back the share below of its best run closes it. 0 switches it off.")
+
+profitLockGiveBack = input.float(40, "Profit Lock Give Back (%)", minval = 5, maxval = 95, step = 5, group = groupStrategy, tooltip = "Share of the best run the trade may hand back after the profit lock has started.")
 
 exitOnFilteredFlip = input.bool(true, "Exit On Filtered Opposite Signal", group = groupStrategy, tooltip = "When the fakeout filter suppresses an opposite signal, the trailing stop behind the signals has still been crossed. On: the trade is closed there and no new trade is opened. Off: the trade is held until the next signal or another exit.")
 
@@ -3367,33 +3373,49 @@ if openProfitAtr > peakProfitAtr
 
 
 
-// The strategy trades exactly the signals printed above, one trade per signal, and
+// The strategy trades exactly the signals printed above, one trade per signal. Every
 
-// every trade ends with one exit label. The old warning only fired when a one-bar
+// rule below is measured in R, the distance from the entry to the initial stop, so it
 
-// reversal event happened to land on a bar where the leg was also in profit, and its
+// means the same thing on a quiet and a wild day. The exits were chosen by replaying
 
-// fallback only when the leg was still in profit at the next signal, so a large share
+// Feb - Sep 2026 XAUUSD 15m and checking each two-month block separately. Only 42% of
 
-// of signals ended with no label at all. A trade is now closed by the first of:
+// signals ever reach 1R but the best 10% run past 4R, so the old exits - a profit
 
-//   1. the TP/SL points, when switched on (filled inside the bar, read back below)
+// lock at 1 ATR giving back half, and a take profit on the first reversal hint at any
 
-//   2. the take profit warning - the yellow label is now a real exit order
+// profit - banked a few points on the trends and still took full losses in chop.
 
-//   3. the profit lock - the trade ran into profit and has given half of it back
+// A trade is closed by the first of:
+
+//   1. its stop: the trailing line at entry, moved to breakeven once the trade has
+
+//      run Breakeven At R (or the TP/SL points when those are On)
+
+//   2. the take profit warning (yellow) once the trade is at least Take Profit Min R up
+
+//   3. the profit lock: after Profit Lock Start R, giving back Profit Lock Give Back %
+
+//      of the best run
 
 //   4. the trailing stop behind the signals flipping against the trade: an opposite
 
 //      signal (the trade is reversed), or one the fakeout filter suppressed
 
-// Exits in profit print the yellow TAKE PROFIT label, exits at a loss a grey EXIT.
+// Exit labels are drawn from the strategy's own fills, so every label is an exit the
+
+// Strategy Tester recorded, at the price it recorded.
 
 
 
 var int   tradeDir   = 0
 
 var float tradeEntry = na
+
+var float tradeRisk  = na
+
+var float tradeQty   = na
 
 var int   tradeBar   = na
 
@@ -3421,51 +3443,53 @@ tpslUnit = ta.atr(10) * atrMultiplier * takeProfitStopLossDistance / 5
 
 
 
-// TP/SL orders fill inside the bar, so those exits are read back from the trade list
+// Labels for every exit the broker emulator filled since the last bar. Orders sent at a
 
-// rather than predicted. Both halves share one stop, so a stop out closes two trade
+// bar's close fill on that close, so they are read back here on the next bar and drawn
 
-// records on the same bar - only one label is drawn for it.
+// on the bar they filled on. Two halves of one position closing together share a label.
 
 if strategy.closedtrades > seenClosed
 
-    int    lastBar = na
-
-    string lastTag = na
+    int lastBar = na
 
     for i = seenClosed to strategy.closedtrades - 1
 
-        string exitTag = strategy.closedtrades.exit_comment(i)
+        int exitBar = strategy.closedtrades.exit_bar_index(i)
 
-        int    exitBar = strategy.closedtrades.exit_bar_index(i)
+        if exitBar != lastBar
 
-        if (exitTag == "TP1" or exitTag == "TP2" or exitTag == "SL") and not (exitBar == lastBar and exitTag == lastTag)
+            string why = strategy.closedtrades.exit_comment(i)
 
-            bool wasLong  = strategy.closedtrades.size(i) > 0
+            why := why == "Buy" or why == "Sell" ? "Signal Flip" : why
 
-            bool isTarget = exitTag != "SL"
+            bool  wasLong = strategy.closedtrades.size(i) > 0
 
-            label.new(exitBar, strategy.closedtrades.exit_price(i), isTarget ? "⚠ TAKE PROFIT (" + exitTag + ")" : "✕ STOP LOSS"
+            bool  won     = strategy.closedtrades.profit(i) > 0
 
-              , color = isTarget ? #ffb300 : #f23645
+            float px      = strategy.closedtrades.exit_price(i)
 
-              , style = wasLong == isTarget ? label.style_label_down : label.style_label_up
+            label.new(exitBar, px, won ? "⚠ TAKE PROFIT" : why == "SL" ? "✕ STOP LOSS" : "✕ EXIT"
 
-              , textcolor = isTarget ? #000000 : #ffffff
+              , color = won ? #ffb300 : why == "SL" ? #f23645 : #787b86
+
+              , style = wasLong == won ? label.style_label_down : label.style_label_up
+
+              , textcolor = won ? #000000 : #ffffff
 
               , yloc = yloc.price
 
-              , size = size.normal)
+              , size = size.normal
+
+              , tooltip = why + ": " + (wasLong ? "long" : "short") + " from " + str.tostring(strategy.closedtrades.entry_price(i), format.mintick) + " closed at " + str.tostring(px, format.mintick))
 
             lastBar := exitBar
-
-            lastTag := exitTag
 
     seenClosed := strategy.closedtrades
 
 
 
-// The TP/SL orders closed the whole position.
+// The stop or TP/SL orders closed the whole position inside the bar.
 
 if tradeDir != 0 and bar_index > tradeBar and strategy.position_size == 0
 
@@ -3485,27 +3509,27 @@ if tradeDir == -1
 
 
 
-float openRun = tradeDir == 1 ? close - tradeEntry : tradeDir == -1 ? tradeEntry - close : 0.0
+float runR  = tradeDir == 0 ? 0.0 : (close - tradeEntry) * tradeDir / tradeRisk
 
-float bestRun = tradeDir == 1 ? tradeBest - tradeEntry : tradeDir == -1 ? tradeEntry - tradeBest : 0.0
-
-
-
-// Take profit warning: the same reversal events, sensitivity and profit setting as
-
-// before, now tested against the open trade on every bar instead of once per leg.
-
-tpWarnHit = showTakeProfitWarning and tradeDir != 0 and bar_index > tradeBar and (tradeDir == 1 ? bearishExhaustion : bullishExhaustion) and (not tpWarnOnlyInProfit or openRun > 0)
+float bestR = tradeDir == 0 ? 0.0 : (tradeBest - tradeEntry) * tradeDir / tradeRisk
 
 
 
-// Profit lock: the reversal events are one-bar events and can all land on bars where
+// Take profit warning: the same reversal events and sensitivity as before, but only
 
-// the trade is offside. Once a trade has run Profit Lock ATR in its favour, giving back
+// acted on once the trade is Take Profit Min R up. At "any profit" it fired on the
 
-// half of that run is the reversal, and the profit is banked before it turns into a loss.
+// first reversal hint a few points into the trade and cut off every trend.
 
-profitLockHit = profitLockAtr > 0 and tradeDir != 0 and bar_index > tradeBar and bestRun >= profitLockAtr * atr and openRun <= bestRun * 0.5
+tpWarnHit = showTakeProfitWarning and tradeDir != 0 and bar_index > tradeBar and (tradeDir == 1 ? bearishExhaustion : bullishExhaustion) and (tpWarnOnlyInProfit ? runR >= math.max(tpMinR, 0.0001) : true)
+
+
+
+// Profit lock: once a trade has run Profit Lock Start R, handing back Give Back % of
+
+// that run is treated as the turn and the rest is banked.
+
+profitLockHit = profitLockR > 0 and tradeDir != 0 and bar_index > tradeBar and bestR >= profitLockR and runR <= bestR * (1 - profitLockGiveBack / 100)
 
 
 
@@ -3515,37 +3539,15 @@ flipAgainst = tradeDir == 1 ? (sellSignal or (exitOnFilteredFlip and os < os[1])
 
 
 
-exitReason = tpWarnHit ? "Take Profit Warning" : profitLockHit ? "Profit Lock" : flipAgainst ? "Signal Flip" : ""
+exitReason = tpWarnHit ? "TP Warning" : profitLockHit ? "Profit Lock" : flipAgainst ? "Signal Flip" : ""
 
 
 
 if tradeDir != 0 and exitReason != ""
 
-    bool exitLong     = tradeDir == 1
+    bool exitLong  = tradeDir == 1
 
-    bool exitInProfit = openRun > 0
-
-    bool reversing    = exitLong ? sellSignal : buySignal
-
-    // An opposite signal on this bar already sits on the usual side of the candle,
-
-    // so the exit label moves to the other side instead of covering it.
-
-    bool labelAbove   = exitLong ? not reversing : reversing
-
-    label.new(n, close, exitInProfit ? "⚠ TAKE PROFIT" : "✕ EXIT"
-
-      , color = exitInProfit ? #ffb300 : #787b86
-
-      , style = labelAbove ? label.style_label_down : label.style_label_up
-
-      , textcolor = exitInProfit ? #000000 : #ffffff
-
-      , yloc = labelAbove ? yloc.abovebar : yloc.belowbar
-
-      , size = size.normal
-
-      , tooltip = exitReason + ": " + (exitLong ? "long" : "short") + " from " + str.tostring(tradeEntry, format.mintick) + " closed at " + str.tostring(close, format.mintick))
+    bool reversing = exitLong ? sellSignal : buySignal
 
     // On a reversal the opposite entry below closes this trade itself. Closing it here
 
@@ -3555,31 +3557,57 @@ if tradeDir != 0 and exitReason != ""
 
         strategy.close(exitLong ? "Long" : "Short", comment = exitReason)
 
-    alert((exitInProfit ? "Take profit: " : "Exit: ") + "close your " + (exitLong ? "long" : "short") + " (" + exitReason + ")", alert.freq_once_per_bar_close)
+    alert((runR > 0 ? "Take profit: " : "Exit: ") + "close your " + (exitLong ? "long" : "short") + " (" + exitReason + ")", alert.freq_once_per_bar_close)
 
     tradeDir := 0
 
 
 
+// Breakeven: once the trade has run Breakeven At R, the stop moves to the entry.
+
+if tradeDir != 0 and breakevenR > 0 and bestR >= breakevenR and (tradeDir == 1 ? tradeSL < tradeEntry : tradeSL > tradeEntry)
+
+    tradeSL := tradeEntry
+
+    string entryId = tradeDir == 1 ? "Long" : "Short"
+
+    string pfx     = tradeDir == 1 ? "L " : "S "
+
+    if useTPSL
+
+        // TP1 is only still working while the full position is open.
+
+        if math.abs(strategy.position_size) >= tradeQty
+
+            strategy.exit(pfx + "TP1", entryId, qty_percent = 50, limit = tradeTP1, stop = tradeSL, comment_profit = "TP1", comment_loss = "Breakeven")
+
+        strategy.exit(pfx + "TP2", entryId, limit = tradeTP2, stop = tradeSL, comment_profit = "TP2", comment_loss = "Breakeven")
+
+    else
+
+        strategy.exit(pfx + "SL", entryId, stop = tradeSL, comment = "Breakeven")
+
+
+
 // Position size for a fixed % risk. Without TP/SL points the stop is the trailing stop
 
-// line at entry: that is the level whose break flips the signal, so it is where this
+// line at entry: the level whose break flips the signal, so it is where this system is
 
-// system is proven wrong. A hard stop order sits there, so a trade cannot lose more
-
-// than the planned risk when a bar closes far beyond the line (a price gap still can).
+// proven wrong, and a hard stop order sits there.
 
 float entryStopDist = useTPSL ? tpslUnit : math.abs(close - ts)
 
 entryStopDist := na(entryStopDist) or entryStopDist <= 0 ? atr : entryStopDist
 
-// TradingView only fills whole contracts here, and a fractional size rounds to 0 and
 
-// the order is dropped - the "report requires trade data" error. On a $100-per-point
 
-// XAUUSD contract a small account cannot reach 1 contract at 1% risk, so the size never
+// TradingView rounds a CFD order down to whole units and skips anything that rounds to
 
-// goes below 1 and the risk actually taken is shown on the dashboard.
+// 0, so the size never goes below 1 unit. On a feed where 1 unit is 100 oz ($100 a
+
+// point) a small account cannot reach 1 unit at 1% risk; the risk actually taken is
+
+// shown on the dashboard.
 
 float riskQty = math.max(math.floor(strategy.equity * riskPercent / 100 / (entryStopDist * syminfo.pointvalue)), 1)
 
@@ -3594,6 +3622,10 @@ if buySignal and tradeDir != 1
     tradeDir   := 1
 
     tradeEntry := close
+
+    tradeRisk  := entryStopDist
+
+    tradeQty   := riskQty
 
     tradeBar   := bar_index
 
@@ -3624,6 +3656,10 @@ if sellSignal and tradeDir != -1
     tradeDir   := -1
 
     tradeEntry := close
+
+    tradeRisk  := entryStopDist
+
+    tradeQty   := riskQty
 
     tradeBar   := bar_index
 
