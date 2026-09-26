@@ -3823,3 +3823,23 @@ if showDashboard and barstate.islast
 
     tb.cell(2, 0, na(lastRiskPct) ? "" : "Risk " + str.tostring(lastRiskPct, "#.##") + "%", text_color = lastRiskPct > riskPercent * 1.5 ? dashboardRedText : dashboardGreenText, text_size = table_size, tooltip = "Risk taken on the last signal. Above the Risk Per Trade setting means the account is too small for 1 contract at that risk - raise Initial capital in Properties.")
 
+
+
+// The account risk cannot be met when a single unit of the chart's symbol already risks
+
+// more than it. Said on the chart, because the Strategy Tester silently sizes 1 unit.
+
+var table sizeWarn = table.new(position.top_center, 1, 1, bgcolor = #49343e, frame_color = #f23645, frame_width = 1)
+
+if barstate.islast
+
+    float minRiskPct = entryStopDist * syminfo.pointvalue / strategy.equity * 100
+
+    if minRiskPct > riskPercent * 1.5
+
+        table.cell(sizeWarn, 0, 0, "⚠ 1 unit of " + syminfo.tickerid + " = $" + str.tostring(syminfo.pointvalue, "#.##") + " per point, so the smallest trade risks " + str.tostring(minRiskPct, "#.#") + "% of the account, not " + str.tostring(riskPercent, "#.#") + "%.\nTradingView cannot trade part of a unit. Use a feed where 1 unit = 1 oz (e.g. OANDA:XAUUSD) for " + str.tostring(riskPercent, "#.#") + "% risk.", text_color = color.white, text_size = size.normal)
+
+    else
+
+        table.clear(sizeWarn, 0, 0)
+
