@@ -32,7 +32,7 @@ c_bg = color.new(color.blue, 100)
 
 
 
-strategy("Lux Algo Signals & Overlays [6.3] Strategy", "Lux Algo Signals & Overlays [6.3]", overlay = true, max_labels_count = 500, pyramiding = 0, initial_capital = 10000, default_qty_type = strategy.percent_of_equity, default_qty_value = 100, process_orders_on_close = true, calc_on_every_tick = false)
+strategy("Lux Algo Signals & Overlays [6.3] Strategy", "Lux Algo Signals & Overlays [6.3]", overlay = true, max_labels_count = 500, pyramiding = 0, initial_capital = 10000, default_qty_type = strategy.fixed, default_qty_value = 1, margin_long = 0, margin_short = 0, process_orders_on_close = true, calc_on_every_tick = false)
 
 //import Libraries
 
@@ -3726,4 +3726,22 @@ slPlot     = plot(showLevels ? tradeSL    : na, "Stop Loss",   color.new(color.r
 fill(entryPlot, tp2Plot, color.new(#3666f5, 85), editable = false)
 
 fill(entryPlot, slPlot, color.new(color.red, 85), editable = false)
+
+// Signals printed vs trades taken, so a symbol the orders cannot fill on is obvious.
+
+var int signalCount = 0
+
+
+
+if buySignal or sellSignal
+
+    signalCount += 1
+
+
+
+if showDashboard and barstate.islast
+
+    tb.cell(0, 0, "📊 Signals / Trades", text_color = color.white, text_size = table_size, text_halign = text.align_left)
+
+    tb.cell(1, 0, str.tostring(signalCount) + " / " + str.tostring(strategy.closedtrades + strategy.opentrades), text_color = color.white, text_size = table_size)
 
