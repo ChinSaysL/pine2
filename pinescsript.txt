@@ -2693,7 +2693,15 @@ fromCluster = 'Best'
 
 maxIter = 250
 
-maxData = 2500
+// Signals are only calculated on this many of the most recent bars, so it is also how
+
+// far back the Strategy Tester can go. It was 2500 - about 5 weeks of 15m. A longer
+
+// history leaves the recent signals unchanged; lower it if TradingView reports the
+
+// script taking too long.
+
+maxData = input.int(20000, "Backtest History (bars)", minval = 500, maxval = 50000, step = 500, group = groupStrategy, tooltip = "How many of the most recent bars get signals, and therefore how far back the Strategy Tester reaches. The original script used 2500 (about 5 weeks on 15m). More history does not change the recent signals.")
 
 
 
