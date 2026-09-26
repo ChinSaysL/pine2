@@ -145,6 +145,10 @@ groupStrategy = "STRATEGY EXITS"
 
 maxStopAtr = input.float(1.5, "Max Stop Distance (ATR)", minval = 0, step = 0.25, group = groupStrategy, tooltip = "The initial stop is the trailing line behind the signals, but never further than this many ATR from the entry. The line averages about 2.5 ATR away; capping it at 1.5 lifted the Feb - Sep 2026 XAUUSD 15m replay from +31R to +72R with every month positive. 0 = always use the trailing line.")
 
+entryPullbackAtr = input.float(0.25, "Entry Pullback (ATR)", minval = 0, step = 0.05, group = groupStrategy, tooltip = "Instead of buying the signal candle's close, a limit order waits this many ATR better, keeping the same stop. The trade risks less for the same stop, so the position is larger and the same move is worth more R, and signals that never pull back are skipped. Replayed Feb - Sep 2026 XAUUSD 15m at 0.5% risk: profit factor 1.14 -> 1.36 and FTMO-style pass rate 78% -> 92%; 0.15 to 0.3 all worked. 0 = enter at the close.")
+
+pullbackBars = input.int(4, "Pullback Order Valid (bars)", minval = 1, maxval = 20, group = groupStrategy, tooltip = "The limit order is cancelled if it has not filled after this many bars, when an opposite signal prints, and before news or the daily close.")
+
 tpMinR = input.float(2.0, "Take Profit Min Profit (R)", minval = 0, step = 0.25, group = groupStrategy, tooltip = "The yellow take profit warning only closes the trade once it is at least this many R in profit (1R = entry to initial stop). Replayed Feb - Sep 2026 XAUUSD 15m, 2 to 3 all worked; lower values cut the few big winners that carry this strategy. Needs Only Warn When In Profit on.")
 
 breakevenR = input.float(0.0, "Breakeven At (R)", minval = 0, step = 0.25, group = groupStrategy, tooltip = "Moves the stop to the entry once the trade has closed this many R in profit. 0 = off (the default: with the tighter stop it only cut winners).")
@@ -3526,6 +3530,46 @@ if strategy.closedtrades > seenClosed
 
 
 
+// A pullback limit order waiting to fill.
+
+var int   pendDir  = 0
+
+var int   pendBar  = na
+
+var float pendStop = na
+
+var float pendQty  = na
+
+
+
+// The limit order filled inside the bar: the trade starts here, from its fill price.
+
+if pendDir != 0 and (pendDir == 1 ? strategy.position_size > 0 : strategy.position_size < 0)
+
+    tradeDir   := pendDir
+
+    tradeEntry := strategy.position_avg_price
+
+    tradeRisk  := math.abs(tradeEntry - pendStop)
+
+    tradeQty   := pendQty
+
+    tradeBar   := bar_index
+
+    tradeBest  := close
+
+    tradeSL    := pendStop
+
+    pendDir    := 0
+
+
+
+// It filled and was stopped out within the same bar.
+
+if pendDir != 0 and strategy.position_size == 0 and strategy.closedtrades > 0 and strategy.closedtrades.entry_bar_index(strategy.closedtrades - 1) > pendBar
+
+    pendDir := 0
+
 // The stop or TP/SL orders closed the whole position inside the bar.
 
 if tradeDir != 0 and bar_index > tradeBar and strategy.position_size == 0
@@ -3696,6 +3740,10 @@ inTradeSession = not useSession or na(time(timeframe.period, "0200-0700", "UTC")
 
 canEnter = inTradeSession and not nearNews and not nearClose and not limitHit and riskFits
 
+// Pullback entry, used whenever the stop leaves room for it; otherwise enter at the close.
+
+bool usePull = entryPullbackAtr > 0 and not useTPSL and entryStopDist > (entryPullbackAtr + 0.5) * atr
+
 exitReason = limitHit ? "Loss Limit" : tpWarnHit ? "TP Warning" : nearNews ? "News" : nearClose ? "Market Close" : profitLockHit ? "Profit Lock" : flipAgainst ? "Signal Flip" : ""
 
 
@@ -3704,7 +3752,7 @@ if tradeDir != 0 and exitReason != ""
 
     bool exitLong  = tradeDir == 1
 
-    bool reversing = (exitLong ? sellSignal : buySignal) and canEnter
+    bool reversing = (exitLong ? sellSignal : buySignal) and canEnter and not usePull
 
     // On a reversal the opposite entry below closes this trade itself. Closing it here
 
@@ -3746,71 +3794,129 @@ if tradeDir != 0 and breakevenR > 0 and bestR >= breakevenR and (tradeDir == 1 ?
 
 
 
+// A waiting pullback order is cancelled when it expires, before news or the daily
+
+// close (so nothing can fill inside those windows), at a loss limit, or when an
+
+// opposite signal prints.
+
+if pendDir != 0 and (bar_index >= pendBar + pullbackBars or nearNews or nearClose or limitHit or (pendDir == 1 ? sellSignal : buySignal))
+
+    strategy.cancel(pendDir == 1 ? "Long" : "Short")
+
+    pendDir := 0
+
+
+
 if buySignal and tradeDir != 1 and canEnter
 
-    strategy.entry("Long", strategy.long, qty = riskQty, comment = "Buy")
+    if usePull
 
-    tradeDir   := 1
+        float lim = close - entryPullbackAtr * atr
 
-    tradeEntry := close
+        float stp = close - entryStopDist
 
-    tradeRisk  := entryStopDist
+        float q   = math.max(math.floor(strategy.equity * riskPercent / 100 / ((lim - stp) * syminfo.pointvalue)), 1)
 
-    tradeQty   := riskQty
+        strategy.entry("Long", strategy.long, qty = q, limit = lim, comment = "Buy")
 
-    tradeBar   := bar_index
+        strategy.exit("L SL", "Long", stop = stp, comment = "SL")
 
-    tradeBest  := close
+        pendDir  := 1
 
-    tradeSL    := close - entryStopDist
+        pendBar  := bar_index
 
-    tradeTP1   := close + tpslUnit
+        pendStop := stp
 
-    tradeTP2   := close + 2 * tpslUnit
-
-    if useTPSL
-
-        strategy.exit("L TP1", "Long", qty_percent = 50, limit = tradeTP1, stop = tradeSL, comment_profit = "TP1", comment_loss = "SL")
-
-        strategy.exit("L TP2", "Long", limit = tradeTP2, stop = tradeSL, comment_profit = "TP2", comment_loss = "SL")
+        pendQty  := q
 
     else
 
-        strategy.exit("L SL", "Long", stop = tradeSL, comment = "SL")
+        strategy.entry("Long", strategy.long, qty = riskQty, comment = "Buy")
+
+        tradeDir   := 1
+
+        tradeEntry := close
+
+        tradeRisk  := entryStopDist
+
+        tradeQty   := riskQty
+
+        tradeBar   := bar_index
+
+        tradeBest  := close
+
+        tradeSL    := close - entryStopDist
+
+        tradeTP1   := close + tpslUnit
+
+        tradeTP2   := close + 2 * tpslUnit
+
+        if useTPSL
+
+            strategy.exit("L TP1", "Long", qty_percent = 50, limit = tradeTP1, stop = tradeSL, comment_profit = "TP1", comment_loss = "SL")
+
+            strategy.exit("L TP2", "Long", limit = tradeTP2, stop = tradeSL, comment_profit = "TP2", comment_loss = "SL")
+
+        else
+
+            strategy.exit("L SL", "Long", stop = tradeSL, comment = "SL")
 
 
 
 if sellSignal and tradeDir != -1 and canEnter
 
-    strategy.entry("Short", strategy.short, qty = riskQty, comment = "Sell")
+    if usePull
 
-    tradeDir   := -1
+        float lim = close + entryPullbackAtr * atr
 
-    tradeEntry := close
+        float stp = close + entryStopDist
 
-    tradeRisk  := entryStopDist
+        float q   = math.max(math.floor(strategy.equity * riskPercent / 100 / ((stp - lim) * syminfo.pointvalue)), 1)
 
-    tradeQty   := riskQty
+        strategy.entry("Short", strategy.short, qty = q, limit = lim, comment = "Sell")
 
-    tradeBar   := bar_index
+        strategy.exit("S SL", "Short", stop = stp, comment = "SL")
 
-    tradeBest  := close
+        pendDir  := -1
 
-    tradeSL    := close + entryStopDist
+        pendBar  := bar_index
 
-    tradeTP1   := close - tpslUnit
+        pendStop := stp
 
-    tradeTP2   := close - 2 * tpslUnit
-
-    if useTPSL
-
-        strategy.exit("S TP1", "Short", qty_percent = 50, limit = tradeTP1, stop = tradeSL, comment_profit = "TP1", comment_loss = "SL")
-
-        strategy.exit("S TP2", "Short", limit = tradeTP2, stop = tradeSL, comment_profit = "TP2", comment_loss = "SL")
+        pendQty  := q
 
     else
 
-        strategy.exit("S SL", "Short", stop = tradeSL, comment = "SL")
+        strategy.entry("Short", strategy.short, qty = riskQty, comment = "Sell")
+
+        tradeDir   := -1
+
+        tradeEntry := close
+
+        tradeRisk  := entryStopDist
+
+        tradeQty   := riskQty
+
+        tradeBar   := bar_index
+
+        tradeBest  := close
+
+        tradeSL    := close + entryStopDist
+
+        tradeTP1   := close - tpslUnit
+
+        tradeTP2   := close - 2 * tpslUnit
+
+        if useTPSL
+
+            strategy.exit("S TP1", "Short", qty_percent = 50, limit = tradeTP1, stop = tradeSL, comment_profit = "TP1", comment_loss = "SL")
+
+            strategy.exit("S TP2", "Short", limit = tradeTP2, stop = tradeSL, comment_profit = "TP2", comment_loss = "SL")
+
+        else
+
+            strategy.exit("S SL", "Short", stop = tradeSL, comment = "SL")
 
 
 
