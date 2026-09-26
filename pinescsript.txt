@@ -3573,7 +3573,17 @@ float entryStopDist = useTPSL ? tpslUnit : math.abs(close - ts)
 
 entryStopDist := na(entryStopDist) or entryStopDist <= 0 ? atr : entryStopDist
 
-float riskQty = math.max(math.floor(strategy.equity * riskPercent / 100 / (entryStopDist * syminfo.pointvalue) * 100) / 100, 0.01)
+// TradingView only fills whole contracts here, and a fractional size rounds to 0 and
+
+// the order is dropped - the "report requires trade data" error. On a $100-per-point
+
+// XAUUSD contract a small account cannot reach 1 contract at 1% risk, so the size never
+
+// goes below 1 and the risk actually taken is shown on the dashboard.
+
+float riskQty = math.max(math.floor(strategy.equity * riskPercent / 100 / (entryStopDist * syminfo.pointvalue)), 1)
+
+float riskTakenPct = riskQty * entryStopDist * syminfo.pointvalue / strategy.equity * 100
 
 
 
@@ -3757,11 +3767,15 @@ fill(entryPlot, slPlot, color.new(color.red, 85), editable = false)
 
 var int signalCount = 0
 
+var float lastRiskPct = na
+
 
 
 if buySignal or sellSignal
 
     signalCount += 1
+
+    lastRiskPct := riskTakenPct
 
 
 
@@ -3770,4 +3784,6 @@ if showDashboard and barstate.islast
     tb.cell(0, 0, "📊 Signals / Trades", text_color = color.white, text_size = table_size, text_halign = text.align_left)
 
     tb.cell(1, 0, str.tostring(signalCount) + " / " + str.tostring(strategy.closedtrades + strategy.opentrades), text_color = color.white, text_size = table_size)
+
+    tb.cell(2, 0, na(lastRiskPct) ? "" : "Risk " + str.tostring(lastRiskPct, "#.##") + "%", text_color = lastRiskPct > riskPercent * 1.5 ? dashboardRedText : dashboardGreenText, text_size = table_size, tooltip = "Risk taken on the last signal. Above the Risk Per Trade setting means the account is too small for 1 contract at that risk - raise Initial capital in Properties.")
 
