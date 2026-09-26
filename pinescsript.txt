@@ -161,6 +161,12 @@ riskPercent = input.float(0.5, "Risk Per Trade (%)", minval = 0.1, maxval = 10, 
 
 useSession = input.bool(false, "Skip Quiet Tokyo Hours (02:00-07:00 UTC)", group = groupStrategy, tooltip = "Signals from 02:00 to 07:00 UTC (11:00-16:00 Tokyo) still print but are not traded. Replayed on Feb - Sep 2026 XAUUSD 15m, the Tokyo open (00:00-02:00 UTC) was the strongest window of the day (profit factor 1.75), while the rest of the Tokyo session lost in both halves of the test (profit factor 0.78). Skipping it raised the total from +31R to +37R and cut the worst drawdown from 15R to 10R.")
 
+volFilter = input.bool(true, "Volatility Filter", group = groupStrategy, tooltip = "Only trades signals while volatility (ATR) is in the middle of its recent range: above the Min and below the Max percentile of the last 500 bars. The quietest stretches produce drifting signals and the wildest ones produce whipsaws. On Feb - Sep 2026 XAUUSD 15m, checked on the real data and on four copies with every candle randomly shifted to mimic another broker's feed: profit factor 1.23 -> 1.67, worst drawdown 16% -> 9%, similar total return from about 40% of the trades. Bands from 25-65 to 30-70 all worked.")
+
+volMinPct = input.int(30, "Min Volatility Percentile", minval = 0, maxval = 100, group = groupStrategy)
+
+volMaxPct = input.int(70, "Max Volatility Percentile", minval = 0, maxval = 100, group = groupStrategy)
+
 // Prop Firm Rules
 
 groupProp = "PROP FIRM RULES (FTMO)"
@@ -3720,7 +3726,13 @@ bool  riskFits = not propRules or (dayLossPct + newTradeRiskPct <= dailyLimitPct
 
 inTradeSession = not useSession or na(time(timeframe.period, "0200-0700", "UTC"))
 
-canEnter = inTradeSession and not nearNews and not nearClose and not limitHit and riskFits
+// Where the current ATR sits among the last 500 bars; filled in during warm-up.
+
+float atrPct = ta.percentrank(atr, 500)
+
+bool  volOk  = not volFilter or na(atrPct) or (atrPct >= volMinPct and atrPct < volMaxPct)
+
+canEnter = inTradeSession and volOk and not nearNews and not nearClose and not limitHit and riskFits
 
 // Pullback entry, used whenever the stop leaves room for it; otherwise enter at the close.
 
