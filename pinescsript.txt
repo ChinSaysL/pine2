@@ -143,11 +143,13 @@ tpWarnEverySignal = input.bool(false, "Show Best Exit In Hindsight (review only)
 
 groupStrategy = "STRATEGY EXITS"
 
-tpMinR = input.float(0.5, "Take Profit Min Profit (R)", minval = 0, step = 0.25, group = groupStrategy, tooltip = "The yellow take profit warning only closes the trade once it is at least this many R in profit (1R = entry to initial stop). Needs Only Warn When In Profit on.")
+maxStopAtr = input.float(1.5, "Max Stop Distance (ATR)", minval = 0, step = 0.25, group = groupStrategy, tooltip = "The initial stop is the trailing line behind the signals, but never further than this many ATR from the entry. The line averages about 2.5 ATR away; capping it at 1.5 lifted the Feb - Sep 2026 XAUUSD 15m replay from +31R to +72R with every month positive. 0 = always use the trailing line.")
 
-breakevenR = input.float(1.5, "Breakeven At (R)", minval = 0, step = 0.25, group = groupStrategy, tooltip = "Moves the stop to the entry once the trade has closed this many R in profit. 0 switches it off.")
+tpMinR = input.float(2.0, "Take Profit Min Profit (R)", minval = 0, step = 0.25, group = groupStrategy, tooltip = "The yellow take profit warning only closes the trade once it is at least this many R in profit (1R = entry to initial stop). Replayed Feb - Sep 2026 XAUUSD 15m, 2 to 3 all worked; lower values cut the few big winners that carry this strategy. Needs Only Warn When In Profit on.")
 
-profitLockR = input.float(2.0, "Profit Lock Start (R)", minval = 0, step = 0.25, group = groupStrategy, tooltip = "Once a trade has closed this many R in profit, giving back the share below of its best run closes it. 0 switches it off.")
+breakevenR = input.float(0.0, "Breakeven At (R)", minval = 0, step = 0.25, group = groupStrategy, tooltip = "Moves the stop to the entry once the trade has closed this many R in profit. 0 = off (the default: with the tighter stop it only cut winners).")
+
+profitLockR = input.float(0.0, "Profit Lock Start (R)", minval = 0, step = 0.25, group = groupStrategy, tooltip = "Once a trade has closed this many R in profit, giving back the share below of its best run closes it. 0 = off (the default: with the tighter stop it made no difference or cut winners).")
 
 profitLockGiveBack = input.float(40, "Profit Lock Give Back (%)", minval = 5, maxval = 95, step = 5, group = groupStrategy, tooltip = "Share of the best run the trade may hand back after the profit lock has started.")
 
@@ -3389,25 +3391,29 @@ if openProfitAtr > peakProfitAtr
 
 // means the same thing on a quiet and a wild day. The exits were chosen by replaying
 
-// Feb - Sep 2026 XAUUSD 15m and checking each two-month block separately. Only 42% of
+// Feb - Sep 2026 XAUUSD 15m, choosing on Feb - May and checking on Jun - Sep. The
 
-// signals ever reach 1R but the best 10% run past 4R, so the old exits - a profit
+// profit comes from a few large winners, so the exits are built to keep them: a stop
 
-// lock at 1 ATR giving back half, and a take profit on the first reversal hint at any
+// no wider than Max Stop Distance ATR (the trailing line alone averages ~2.5 ATR and
 
-// profit - banked a few points on the trends and still took full losses in chop.
+// let losers run), and a take profit that waits until the trade is 2R up instead of
+
+// banking a few points on the first reversal hint. Entry filters (higher timeframe
+
+// trend, chop, quality, volatility) were tested too and none held up out of sample.
 
 // A trade is closed by the first of:
 
-//   1. its stop: the trailing line at entry, moved to breakeven once the trade has
+//   1. its stop: the trailing line at entry capped at Max Stop Distance ATR, or the
 
-//      run Breakeven At R (or the TP/SL points when those are On)
+//      TP/SL points when those are On; optionally moved to breakeven at Breakeven At R
 
 //   2. the take profit warning (yellow) once the trade is at least Take Profit Min R up
 
-//   3. the profit lock: after Profit Lock Start R, giving back Profit Lock Give Back %
+//   3. the profit lock, when switched on: after Profit Lock Start R, giving back Profit
 
-//      of the best run
+//      Lock Give Back % of the best run
 
 //   4. the trailing stop behind the signals flipping against the trade: an opposite
 
@@ -3605,11 +3611,11 @@ if tradeDir != 0 and breakevenR > 0 and bestR >= breakevenR and (tradeDir == 1 ?
 
 // Position size for a fixed % risk. Without TP/SL points the stop is the trailing stop
 
-// line at entry: the level whose break flips the signal, so it is where this system is
+// line at entry - the level whose break flips the signal - capped at Max Stop Distance
 
-// proven wrong, and a hard stop order sits there.
+// ATR. A hard stop order sits there.
 
-float entryStopDist = useTPSL ? tpslUnit : math.abs(close - ts)
+float entryStopDist = useTPSL ? tpslUnit : maxStopAtr > 0 ? math.min(math.abs(close - ts), maxStopAtr * atr) : math.abs(close - ts)
 
 entryStopDist := na(entryStopDist) or entryStopDist <= 0 ? atr : entryStopDist
 
