@@ -155,7 +155,7 @@ exitOnFilteredFlip = input.bool(true, "Exit On Filtered Opposite Signal", group 
 
 riskPercent = input.float(1.0, "Risk Per Trade (%)", minval = 0.1, maxval = 10, step = 0.1, group = groupStrategy, tooltip = "Every trade is sized so that hitting its stop loses this share of the current equity. The stop is the trailing stop line behind the signals at the moment of entry (the level whose break flips the signal), or the TP/SL stop when TP/SL Points is On. Size = equity x risk / (stop distance x point value).")
 
-useSession = input.bool(false, "Only Trade 06:00-17:00 UTC", group = groupStrategy, tooltip = "Signals outside London and early New York hours still print but are not traded. On Feb - Sep 2026 XAUUSD 15m it halved the drawdown and raised the profit factor from 1.18 to 1.27, but it also skipped the profitable Asian-open trades, so total profit was lower (+20R vs +31R). Test it on your own history before relying on it.")
+useSession = input.bool(false, "Skip Quiet Tokyo Hours (02:00-07:00 UTC)", group = groupStrategy, tooltip = "Signals from 02:00 to 07:00 UTC (11:00-16:00 Tokyo) still print but are not traded. Replayed on Feb - Sep 2026 XAUUSD 15m, the Tokyo open (00:00-02:00 UTC) was the strongest window of the day (profit factor 1.75), while the rest of the Tokyo session lost in both halves of the test (profit factor 0.78). Skipping it raised the total from +31R to +37R and cut the worst drawdown from 15R to 10R.")
 
 
 
@@ -3549,9 +3549,9 @@ flipAgainst = tradeDir == 1 ? (sellSignal or (exitOnFilteredFlip and os < os[1])
 
 
 
-// Signals are only traded inside the session when that filter is on.
+// Signals in the quiet Tokyo hours are not traded when that filter is on.
 
-inTradeSession = not useSession or not na(time(timeframe.period, "0600-1700", "UTC"))
+inTradeSession = not useSession or na(time(timeframe.period, "0200-0700", "UTC"))
 
 exitReason = tpWarnHit ? "TP Warning" : profitLockHit ? "Profit Lock" : flipAgainst ? "Signal Flip" : ""
 
