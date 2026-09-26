@@ -147,6 +147,8 @@ profitLockAtr = input.float(1.0, "Profit Lock (ATR)", minval = 0, step = 0.25, g
 
 exitOnFilteredFlip = input.bool(true, "Exit On Filtered Opposite Signal", group = groupStrategy, tooltip = "When the fakeout filter suppresses an opposite signal, the trailing stop behind the signals has still been crossed. On: the trade is closed there and no new trade is opened. Off: the trade is held until the next signal or another exit.")
 
+riskPercent = input.float(1.0, "Risk Per Trade (%)", minval = 0.1, maxval = 10, step = 0.1, group = groupStrategy, tooltip = "Every trade is sized so that hitting its stop loses this share of the current equity. The stop is the trailing stop line behind the signals at the moment of entry (the level whose break flips the signal), or the TP/SL stop when TP/SL Points is On. Size = equity x risk / (stop distance x point value).")
+
 
 
 if (signalPresets == "Trend Trader [Preset]")
@@ -3559,9 +3561,25 @@ if tradeDir != 0 and exitReason != ""
 
 
 
+// Position size for a fixed % risk. Without TP/SL points the stop is the trailing stop
+
+// line at entry: that is the level whose break flips the signal, so it is where this
+
+// system is proven wrong. A hard stop order sits there, so a trade cannot lose more
+
+// than the planned risk when a bar closes far beyond the line (a price gap still can).
+
+float entryStopDist = useTPSL ? tpslUnit : math.abs(close - ts)
+
+entryStopDist := na(entryStopDist) or entryStopDist <= 0 ? atr : entryStopDist
+
+float riskQty = math.max(math.floor(strategy.equity * riskPercent / 100 / (entryStopDist * syminfo.pointvalue) * 100) / 100, 0.01)
+
+
+
 if buySignal and tradeDir != 1
 
-    strategy.entry("Long", strategy.long, comment = "Buy")
+    strategy.entry("Long", strategy.long, qty = riskQty, comment = "Buy")
 
     tradeDir   := 1
 
@@ -3571,7 +3589,7 @@ if buySignal and tradeDir != 1
 
     tradeBest  := close
 
-    tradeSL    := close - tpslUnit
+    tradeSL    := close - entryStopDist
 
     tradeTP1   := close + tpslUnit
 
@@ -3583,11 +3601,15 @@ if buySignal and tradeDir != 1
 
         strategy.exit("L TP2", "Long", limit = tradeTP2, stop = tradeSL, comment_profit = "TP2", comment_loss = "SL")
 
+    else
+
+        strategy.exit("L SL", "Long", stop = tradeSL, comment = "SL")
+
 
 
 if sellSignal and tradeDir != -1
 
-    strategy.entry("Short", strategy.short, comment = "Sell")
+    strategy.entry("Short", strategy.short, qty = riskQty, comment = "Sell")
 
     tradeDir   := -1
 
@@ -3597,7 +3619,7 @@ if sellSignal and tradeDir != -1
 
     tradeBest  := close
 
-    tradeSL    := close + tpslUnit
+    tradeSL    := close + entryStopDist
 
     tradeTP1   := close - tpslUnit
 
@@ -3608,6 +3630,10 @@ if sellSignal and tradeDir != -1
         strategy.exit("S TP1", "Short", qty_percent = 50, limit = tradeTP1, stop = tradeSL, comment_profit = "TP1", comment_loss = "SL")
 
         strategy.exit("S TP2", "Short", limit = tradeTP2, stop = tradeSL, comment_profit = "TP2", comment_loss = "SL")
+
+    else
+
+        strategy.exit("S SL", "Short", stop = tradeSL, comment = "SL")
 
 
 
@@ -3713,13 +3739,13 @@ plotchar(isBullishTriggerWave and position == -1, "Long", "✖", location.belowb
 
 // placed an order.
 
-showLevels = useTPSL and tradeDir != 0 and bar_index > tradeBar
+showLevels = tradeDir != 0 and bar_index > tradeBar
 
 entryPlot  = plot(showLevels ? tradeEntry : na, "Trade Entry", color.new(#787b86, 0), 1, plot.style_linebr, editable = false)
 
-tp1Plot    = plot(showLevels ? tradeTP1   : na, "TP1",         color.new(#3666f5, 0), 2, plot.style_linebr, editable = false)
+tp1Plot    = plot(showLevels and useTPSL ? tradeTP1 : na, "TP1",         color.new(#3666f5, 0), 2, plot.style_linebr, editable = false)
 
-tp2Plot    = plot(showLevels ? tradeTP2   : na, "TP2",         color.new(#3666f5, 0), 2, plot.style_linebr, editable = false)
+tp2Plot    = plot(showLevels and useTPSL ? tradeTP2 : na, "TP2",         color.new(#3666f5, 0), 2, plot.style_linebr, editable = false)
 
 slPlot     = plot(showLevels ? tradeSL    : na, "Stop Loss",   color.new(color.red, 0), 2, plot.style_linebr, editable = false)
 
