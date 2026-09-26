@@ -134,8 +134,6 @@ tpWarnSensitivity = input.string("Normal", "Warning Sensitivity", ["Early", "Nor
 
 tpWarnOnlyInProfit = input.bool(true, "Only Warn When In Profit", group = groupTakeProfit, tooltip = "Only takes the take profit exit while the trade is in profit. Turn this off to also close losing trades on the same reversal events.")
 
-tpUseTrailFlip = input.bool(true, "Include Smart Trail / Trend Catcher Flips", group = groupTakeProfit, tooltip = "Counts a Smart Trail or Trend Catcher flip against your position as a reversal. These turn on many trades that never reach the reversal zone, which is what gives the warning its coverage without resorting to a fixed distance rule.")
-
 tpWarnEverySignal = input.bool(false, "Show Best Exit In Hindsight (review only)", group = groupTakeProfit, tooltip = "HINDSIGHT ONLY - NOT A LIVE SIGNAL. Marks in grey the best price every profitable trade reached, drawn AFTER that trade has finished. Shown on every trade, including ones that already produced an orange warning, so you can see both on the same trade and judge how far the live warning sat from the ideal exit. It is worked out by looking back over the completed move, so it could not have been known at the time and must never be traded on.")
 
 
@@ -3304,22 +3302,6 @@ touchedLowerInner = low  <= loband1
 
 
 
-// Further reversal events, all already computed elsewhere in this script. These are
-
-// what give the warning its coverage: the reversal zone alone is reached by only a
-
-// fraction of trades, whereas a trail or trend flip happens on most of them. This is
-
-// why no distance or time rule is needed - the reversals themselves carry it.
-
-trailTurnedBear   = tpUseTrailFlip and smartTrailDirection == 'short' and smartTrailDirection[1] == 'long'
-
-trailTurnedBull   = tpUseTrailFlip and smartTrailDirection == 'long'  and smartTrailDirection[1] == 'short'
-
-catcherTurnedBear = tpUseTrailFlip and newTrendCatcherColor != #02ff65 and newTrendCatcherColor[1] == #02ff65
-
-catcherTurnedBull = tpUseTrailFlip and newTrendCatcherColor == #02ff65 and newTrendCatcherColor[1] != #02ff65
-
 
 
 // Momentum rolling back through its own zero line - a reversal in the oscillator
@@ -3334,7 +3316,7 @@ oscTurnedBull = normalBullishMedianCross
 
 // Early  - any single reversal hint, including the inner band and a bare cross.
 
-// Normal - a real reversal event: the zone, a reversal wave, a trail/catcher flip,
+// Normal - a real reversal event: the zone, a reversal wave,
 
 //          or momentum crossing back through zero.
 
@@ -3342,21 +3324,21 @@ oscTurnedBull = normalBullishMedianCross
 
 bearishExhaustion = switch tpWarnSensitivity
 
-    "Early" => touchedUpperInner or inUpperZone or bearishCross or isBearishTriggerWave or trailTurnedBear or catcherTurnedBear or oscTurnedBear
+    "Early" => touchedUpperInner or inUpperZone or bearishCross or isBearishTriggerWave or oscTurnedBear
 
     "Late"  => inUpperZone and isBearishTriggerWave
 
-    => inUpperZone or isBearishTriggerWave or trailTurnedBear or catcherTurnedBear or oscTurnedBear
+    => inUpperZone or isBearishTriggerWave or oscTurnedBear
 
 
 
 bullishExhaustion = switch tpWarnSensitivity
 
-    "Early" => touchedLowerInner or inLowerZone or bullishCross or isBullishTriggerWave or trailTurnedBull or catcherTurnedBull or oscTurnedBull
+    "Early" => touchedLowerInner or inLowerZone or bullishCross or isBullishTriggerWave or oscTurnedBull
 
     "Late"  => inLowerZone and isBullishTriggerWave
 
-    => inLowerZone or isBullishTriggerWave or trailTurnedBull or catcherTurnedBull or oscTurnedBull
+    => inLowerZone or isBullishTriggerWave or oscTurnedBull
 
 
 
