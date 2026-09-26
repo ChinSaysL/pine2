@@ -155,9 +155,30 @@ profitLockGiveBack = input.float(40, "Profit Lock Give Back (%)", minval = 5, ma
 
 exitOnFilteredFlip = input.bool(true, "Exit On Filtered Opposite Signal", group = groupStrategy, tooltip = "When the fakeout filter suppresses an opposite signal, the trailing stop behind the signals has still been crossed. On: the trade is closed there and no new trade is opened. Off: the trade is held until the next signal or another exit.")
 
-riskPercent = input.float(1.0, "Risk Per Trade (%)", minval = 0.1, maxval = 10, step = 0.1, group = groupStrategy, tooltip = "Every trade is sized so that hitting its stop loses this share of the current equity. The stop is the trailing stop line behind the signals at the moment of entry (the level whose break flips the signal), or the TP/SL stop when TP/SL Points is On. Size = equity x risk / (stop distance x point value).")
+riskPercent = input.float(0.5, "Risk Per Trade (%)", minval = 0.1, maxval = 10, step = 0.1, group = groupStrategy, tooltip = "Every trade is sized so that hitting its stop loses this share of the current equity. The stop is the trailing stop line behind the signals at the moment of entry (the level whose break flips the signal), or the TP/SL stop when TP/SL Points is On. Size = equity x risk / (stop distance x point value).")
 
 useSession = input.bool(false, "Skip Quiet Tokyo Hours (02:00-07:00 UTC)", group = groupStrategy, tooltip = "Signals from 02:00 to 07:00 UTC (11:00-16:00 Tokyo) still print but are not traded. Replayed on Feb - Sep 2026 XAUUSD 15m, the Tokyo open (00:00-02:00 UTC) was the strongest window of the day (profit factor 1.75), while the rest of the Tokyo session lost in both halves of the test (profit factor 0.78). Skipping it raised the total from +31R to +37R and cut the worst drawdown from 15R to 10R.")
+
+// Prop Firm Rules
+
+groupProp = "PROP FIRM RULES (FTMO)"
+
+propRules = input.bool(true, "Enforce Loss Limits", group = groupProp, tooltip = "Hard limits measured like FTMO: from the initial balance, with the day starting at midnight Prague time and open losses counted. A new trade is only opened when its full risk still fits under both limits, and everything is closed if a limit is reached. Set below the firm's own limits so slippage and gaps have room.")
+
+dailyLimitPct = input.float(4.0, "Daily Loss Limit (%)", minval = 0.5, maxval = 20, step = 0.5, group = groupProp, tooltip = "FTMO's daily limit is 5% of the initial balance. 4% leaves 1% for slippage and gaps.")
+
+totalLimitPct = input.float(8.0, "Max Loss Limit (%)", minval = 1, maxval = 50, step = 0.5, group = groupProp, tooltip = "FTMO's maximum loss is 10% of the initial balance. 8% leaves room for slippage and gaps. Reaching it stops all trading, so the account can never breach the firm's limit.")
+
+flatBeforeClose = input.bool(true, "Flat Before Daily And Weekend Close", group = groupProp, tooltip = "Closes any open trade at 16:45 New York time, before gold's 17:00 daily and weekend close, and opens nothing until the 18:00 reopen. Nothing is held over the break or the weekend.")
+
+newsFilter = input.bool(true, "Flat Around High-Impact News", group = groupProp, tooltip = "Closes any open trade before each event in the list below and opens nothing until after it, so no order - including a stop - can fill inside the firm's news window.")
+
+newsBeforeMin = input.int(20, "Flat Minutes Before News", minval = 17, maxval = 240, group = groupProp, tooltip = "At least 17 on 15m, so the last bar close before the event is at least 2 minutes before it.")
+
+newsAfterMin = input.int(15, "No Entries Minutes After News", minval = 3, maxval = 240, group = groupProp)
+
+newsList = input.text_area("2026-01-09 08:30\n2026-01-13 08:30\n2026-02-11 08:30\n2026-02-13 08:30\n2026-03-06 08:30\n2026-03-11 08:30\n2026-04-03 08:30\n2026-04-10 08:30\n2026-05-08 08:30\n2026-05-12 08:30\n2026-06-05 08:30\n2026-06-10 08:30\n2026-07-02 08:30\n2026-07-14 08:30\n2026-08-07 08:30\n2026-08-12 08:30\n2026-09-04 08:30\n2026-09-11 08:30\n2026-10-02 08:30\n2026-10-14 08:30\n2026-11-06 08:30\n2026-11-10 08:30\n2026-12-04 08:30\n2026-12-10 08:30\n2026-01-28 14:00\n2026-02-18 14:00\n2026-03-18 14:00\n2026-04-08 14:00\n2026-04-29 14:00\n2026-05-20 14:00\n2026-06-17 14:00\n2026-07-08 14:00\n2026-07-29 14:00\n2026-08-19 14:00\n2026-09-16 14:00\n2026-10-28 14:00\n2026-12-09 14:00", "News Events (New York time)", group = groupProp, tooltip = "One event per line as YYYY-MM-DD HH:MM in New York time. Pre-filled with the 2026 US jobs reports and CPI (08:30) and FOMC decisions and minutes (14:00). Add other high-impact events from your firm's calendar here, and next year's dates when they are published.")
+
 
 
 
@@ -3555,11 +3576,127 @@ flipAgainst = tradeDir == 1 ? (sellSignal or (exitOnFilteredFlip and os < os[1])
 
 
 
+// Position size for a fixed % risk. Without TP/SL points the stop is the trailing stop
+
+// line at entry - the level whose break flips the signal - capped at Max Stop Distance
+
+// ATR. A hard stop order sits there.
+
+float entryStopDist = useTPSL ? tpslUnit : maxStopAtr > 0 ? math.min(math.abs(close - ts), maxStopAtr * atr) : math.abs(close - ts)
+
+entryStopDist := na(entryStopDist) or entryStopDist <= 0 ? atr : entryStopDist
+
+
+
+// TradingView rounds a CFD order down to whole units and skips anything that rounds to
+
+// 0, so the size never goes below 1 unit. On a feed where 1 unit is 100 oz ($100 a
+
+// point) a small account cannot reach 1 unit at 1% risk; the risk actually taken is
+
+// shown on the dashboard.
+
+float riskQty = math.max(math.floor(strategy.equity * riskPercent / 100 / (entryStopDist * syminfo.pointvalue)), 1)
+
+float riskTakenPct = riskQty * entryStopDist * syminfo.pointvalue / strategy.equity * 100
+
+
+
+// # ============================[PROP FIRM RULES]============================ #
+
+
+
+// News events, parsed once from the input list.
+
+var array<int> newsTimes = array.new<int>()
+
+if barstate.isfirst
+
+    for ln in str.split(newsList, "\n")
+
+        array<string> tok = array.new<string>()
+
+        for w in str.split(ln, " ")
+
+            if str.length(w) > 0
+
+                tok.push(w)
+
+        if tok.size() >= 2
+
+            array<string> dt = str.split(tok.get(0), "-")
+
+            array<string> hm = str.split(tok.get(1), ":")
+
+            if dt.size() == 3 and hm.size() == 2
+
+                float yy = str.tonumber(dt.get(0))
+
+                float mo = str.tonumber(dt.get(1))
+
+                float dd = str.tonumber(dt.get(2))
+
+                float hh = str.tonumber(hm.get(0))
+
+                float mi = str.tonumber(hm.get(1))
+
+                if not (na(yy) or na(mo) or na(dd) or na(hh) or na(mi))
+
+                    newsTimes.push(timestamp("America/New_York", int(yy), int(mo), int(dd), int(hh), int(mi)))
+
+
+
+// Decisions are taken at the bar close and fill on it, so the tests use the close time.
+
+bool nearNews = false
+
+if newsFilter
+
+    for e in newsTimes
+
+        if e - time_close <= newsBeforeMin * 60000 and time_close - e <= newsAfterMin * 60000
+
+            nearNews := true
+
+
+
+int nyMinute = hour(time_close, "America/New_York") * 60 + minute(time_close, "America/New_York")
+
+bool nearClose = flatBeforeClose and nyMinute >= 16 * 60 + 45 and nyMinute < 18 * 60
+
+
+
+// FTMO counts from the initial balance and resets the day at midnight Prague time; the
+
+// day starts from the higher of balance and equity, and open losses count.
+
+var float dayStartEquity = strategy.initial_capital
+
+if ta.change(dayofmonth(time_close, "Europe/Prague")) != 0
+
+    dayStartEquity := math.max(strategy.equity, strategy.initial_capital + strategy.netprofit)
+
+float dayLossPct   = (dayStartEquity - strategy.equity) / strategy.initial_capital * 100
+
+float totalLossPct = (strategy.initial_capital - strategy.equity) / strategy.initial_capital * 100
+
+bool  limitHit     = propRules and (dayLossPct >= dailyLimitPct or totalLossPct >= totalLimitPct)
+
+
+
+// A new trade must fit under both limits even if it is stopped out in full.
+
+float newTradeRiskPct = riskQty * entryStopDist * syminfo.pointvalue / strategy.initial_capital * 100
+
+bool  riskFits = not propRules or (dayLossPct + newTradeRiskPct <= dailyLimitPct and totalLossPct + newTradeRiskPct <= totalLimitPct)
+
 // Signals in the quiet Tokyo hours are not traded when that filter is on.
 
 inTradeSession = not useSession or na(time(timeframe.period, "0200-0700", "UTC"))
 
-exitReason = tpWarnHit ? "TP Warning" : profitLockHit ? "Profit Lock" : flipAgainst ? "Signal Flip" : ""
+canEnter = inTradeSession and not nearNews and not nearClose and not limitHit and riskFits
+
+exitReason = limitHit ? "Loss Limit" : tpWarnHit ? "TP Warning" : nearNews ? "News" : nearClose ? "Market Close" : profitLockHit ? "Profit Lock" : flipAgainst ? "Signal Flip" : ""
 
 
 
@@ -3567,7 +3704,7 @@ if tradeDir != 0 and exitReason != ""
 
     bool exitLong  = tradeDir == 1
 
-    bool reversing = (exitLong ? sellSignal : buySignal) and inTradeSession
+    bool reversing = (exitLong ? sellSignal : buySignal) and canEnter
 
     // On a reversal the opposite entry below closes this trade itself. Closing it here
 
@@ -3609,33 +3746,7 @@ if tradeDir != 0 and breakevenR > 0 and bestR >= breakevenR and (tradeDir == 1 ?
 
 
 
-// Position size for a fixed % risk. Without TP/SL points the stop is the trailing stop
-
-// line at entry - the level whose break flips the signal - capped at Max Stop Distance
-
-// ATR. A hard stop order sits there.
-
-float entryStopDist = useTPSL ? tpslUnit : maxStopAtr > 0 ? math.min(math.abs(close - ts), maxStopAtr * atr) : math.abs(close - ts)
-
-entryStopDist := na(entryStopDist) or entryStopDist <= 0 ? atr : entryStopDist
-
-
-
-// TradingView rounds a CFD order down to whole units and skips anything that rounds to
-
-// 0, so the size never goes below 1 unit. On a feed where 1 unit is 100 oz ($100 a
-
-// point) a small account cannot reach 1 unit at 1% risk; the risk actually taken is
-
-// shown on the dashboard.
-
-float riskQty = math.max(math.floor(strategy.equity * riskPercent / 100 / (entryStopDist * syminfo.pointvalue)), 1)
-
-float riskTakenPct = riskQty * entryStopDist * syminfo.pointvalue / strategy.equity * 100
-
-
-
-if buySignal and tradeDir != 1 and inTradeSession
+if buySignal and tradeDir != 1 and canEnter
 
     strategy.entry("Long", strategy.long, qty = riskQty, comment = "Buy")
 
@@ -3669,7 +3780,7 @@ if buySignal and tradeDir != 1 and inTradeSession
 
 
 
-if sellSignal and tradeDir != -1 and inTradeSession
+if sellSignal and tradeDir != -1 and canEnter
 
     strategy.entry("Short", strategy.short, qty = riskQty, comment = "Sell")
 
@@ -3842,6 +3953,10 @@ if showDashboard and barstate.islast
     tb.cell(1, 0, str.tostring(signalCount) + " / " + str.tostring(strategy.closedtrades + strategy.opentrades), text_color = color.white, text_size = table_size)
 
     tb.cell(2, 0, na(lastRiskPct) ? "" : "Risk " + str.tostring(lastRiskPct, "#.##") + "%", text_color = lastRiskPct > riskPercent * 1.5 ? dashboardRedText : dashboardGreenText, text_size = table_size, tooltip = "Risk taken on the last signal. Above the Risk Per Trade setting means the account is too small for 1 contract at that risk - raise Initial capital in Properties.")
+
+    tb.cell(2, 1, "Day " + str.tostring(-dayLossPct, "#.##") + "% / -" + str.tostring(dailyLimitPct, "#.#") + "%", text_color = dayLossPct > dailyLimitPct * 0.75 ? dashboardRedText : dashboardGreenText, text_size = table_size, tooltip = "Today's result (midnight Prague) against the daily loss limit, measured from the initial balance.")
+
+    tb.cell(2, 2, "Total " + str.tostring(-totalLossPct, "#.##") + "% / -" + str.tostring(totalLimitPct, "#.#") + "%", text_color = totalLossPct > totalLimitPct * 0.75 ? dashboardRedText : dashboardGreenText, text_size = table_size, tooltip = "Result since the start against the max loss limit, measured from the initial balance.")
 
 
 
