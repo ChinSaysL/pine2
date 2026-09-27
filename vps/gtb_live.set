@@ -1,0 +1,42 @@
+; Gold Trend Breakout - live settings (v2, 2026-09-27: 1.25% cap, guards 7% / 3.5%, bad regime = half risk). Edit, then: systemctl restart gtb-mt5
+; InpInitialBalance: the account's STARTING balance (FTMO account size), e.g. 100000.
+;   0 = the balance when the EA is first attached (remembered afterwards).
+InpInitialBalance=10000
+InpAdxMin=0
+; 200-day EMA filter: trade only on the trend's side of it (0), -1 = off
+InpEmaSepPct=0
+InpEmaLen=200
+InpRiskMode=1
+InpRiskPercent=1.0
+InpMaxRiskPct=1.25
+InpRiskDivisor=4
+InpMinRiskPct=0.25
+InpPropRules=true
+InpDailyLimitPct=3.5
+InpTotalLimitPct=7.0
+; Challenge mode: stop trading once +InpProfitTarget % is reached with the minimum trading days.
+; InpChallengeStart is server time (FTMO server = New York + 7h), format YYYY.MM.DD HH:MI
+InpChallengeMode=true
+InpProfitTarget=10
+InpMinTradingDays=4
+InpPostTargetRisk=0.1
+InpChallengeStart=2020.01.01 00:00
+InpFlatBeforeClose=true
+InpFlatMinutes=10
+InpNewsFilter=true
+InpNewsBeforeMin=30
+InpNewsAfterMin=30
+; Regime filter: when the paper results of the last 60 days are negative -> all sessions at half risk
+InpRegimeFilter=true
+InpBadMode=1
+InpBadRiskMult=0.5
+InpRegimeDays=60
+InpRegimeMinTrades=5
+InpNYStartHour=8
+InpNYEndHour=17
+InpPaperCost=0.30
+InpServerMinusNY=7
+InpServerMinusPrague=1
+InpMagic=24240001
+InpDeviationPts=50
+InpEventLog=true

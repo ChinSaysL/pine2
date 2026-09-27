@@ -1,0 +1,26 @@
+; Nasdaq Opening-Range Momentum - live settings (2026-09-27). Edit, then: systemctl restart gtb-mt5-nq
+; Trades US100.cash every day (edge independent of gold's regime), at 0.75x the gold EA's risk; no trade on Fed decision days.
+InpRangeMinutes=15
+InpStopFloorAtr=0.3
+InpExitHour=15
+InpExitMinute=55
+InpGate=0
+InpRiskMult=0.75
+InpSkipFomc=true
+InpMaxRiskPct=1.25
+InpRiskDivisor=4
+InpMinRiskPct=0.25
+InpFixedRisk=false
+InpFixedRiskPct=1.0
+; InpInitialBalance: set to the account's STARTING balance for a paid account (same value as the gold preset)
+InpInitialBalance=10000
+InpPropRules=true
+InpDailyLimitPct=3.5
+InpTotalLimitPct=7.0
+InpProfitTarget=10
+InpServerMinusNY=7
+InpServerMinusPrague=1
+InpMagic=24240002
+InpGoldMagic=24240001
+InpDeviationPts=300
+InpEventLog=true
