@@ -1,0 +1,450 @@
+//+------------------------------------------------------------------+
+//| Nasdaq Opening-Range Momentum (US100.cash) - companion to Gold Trend Breakout.
+//| The first 15-minute candle after the 09:30 New York cash open sets the direction (close vs open).
+//| Entry at the open of the next candle, stop at the candle's opposite extreme (at least 0.3 x the
+//| cash-session ATR away), exit 15:55 New York. One trade a day.
+//| Gate: by default it trades only while the Gold Trend Breakout EA reports a BAD regime
+//| (its heartbeat file) - that is where it improved the challenge odds in research.
+//| Risk: same drawdown-scaled sizing and account-wide loss guards as the gold EA; before an entry
+//| the open risk of EVERY position on the account (gold included) is counted.
+//+------------------------------------------------------------------+
+#property copyright "research 2026-09-27"
+#property version   "1.00"
+#property strict
+#include <Trade\Trade.mqh>
+
+enum ENUM_GATE { GATE_ALWAYS = 0, GATE_GOLD_BAD = 1 };
+
+input group "SIGNAL"
+input int    InpRangeMinutes   = 15;    // Opening range (minutes after 09:30 NY) - M15 candle
+input double InpStopFloorAtr   = 0.3;   // Minimum stop distance (x cash-session ATR 14)
+input int    InpExitHour       = 15;    // Exit time, New York
+input int    InpExitMinute     = 55;
+input ENUM_GATE InpGate        = GATE_ALWAYS;   // Trade always (research: its edge does not depend on gold's regime), or only while gold is BAD
+input double InpRiskMult       = 0.75;  // Risk multiplier vs the gold EA's risk (0.75 = best pass rates with gold in research)
+input bool   InpSkipFomc       = true;  // No trade on Fed decision days (14:00 NY statement inside the holding window)
+
+input group "RISK (same scheme as the gold EA)"
+input double InpMaxRiskPct     = 1.25;  // Max risk per trade (% of initial balance)
+input double InpRiskDivisor    = 4;     // Risk = room to the total guard / divisor
+input double InpMinRiskPct     = 0.25;  // Min risk (%)
+input bool   InpFixedRisk      = false; // Tester: fixed risk instead of scaled
+input double InpFixedRiskPct   = 1.0;
+
+input group "PROP FIRM RULES (account-wide)"
+input double InpInitialBalance = 0;     // 0 = the gold EA's stored value, else the balance when first attached
+input bool   InpPropRules      = true;
+input double InpDailyLimitPct  = 3.5;   // Internal daily guard (FTMO: 5%)
+input double InpTotalLimitPct  = 7.0;   // Internal total guard (FTMO: 10%)
+input double InpProfitTarget   = 10;    // Stop opening trades once the account is up this much (0 = off)
+
+input group "CLOCK / EXECUTION"
+input int    InpServerMinusNY     = 7;
+input int    InpServerMinusPrague = 1;
+input long   InpMagic             = 24240002;
+input long   InpGoldMagic         = 24240001;
+input int    InpDeviationPts      = 300;
+input bool   InpEventLog          = true;
+
+// US market holidays and early-close days are computed by UsNoTradeDay() (exchange rules).
+// Fed (FOMC) statement days, federalreserve.gov: news inside the holding window -> no trade (FTMO news rule;
+// in research the 41 FOMC-day trades lost -17R). Update each year.
+string FOMC_DAYS[] = {
+   "2021-01-27","2021-03-17","2021-04-28","2021-06-16","2021-07-28","2021-09-22","2021-11-03","2021-12-15",
+   "2022-01-26","2022-03-16","2022-05-04","2022-06-15","2022-07-27","2022-09-21","2022-11-02","2022-12-14",
+   "2023-02-01","2023-03-22","2023-05-03","2023-06-14","2023-07-26","2023-09-20","2023-11-01","2023-12-13",
+   "2024-01-31","2024-03-20","2024-05-01","2024-06-12","2024-07-31","2024-09-18","2024-11-07","2024-12-18",
+   "2025-01-29","2025-03-19","2025-05-07","2025-06-18","2025-07-30","2025-09-17","2025-10-29","2025-12-10",
+   "2026-01-28","2026-03-18","2026-04-29","2026-06-17","2026-07-29","2026-09-16","2026-10-28","2026-12-09",
+   "2027-01-27","2027-03-17","2027-04-28","2027-06-09","2027-07-28","2027-09-15","2027-10-27","2027-12-08"};
+
+bool FomcDay(datetime server)
+{
+   string d = TimeToString(ToNY(server), TIME_DATE);
+   StringReplace(d, ".", "-");
+   for(int i = 0; i < ArraySize(FOMC_DAYS); i++) if(FOMC_DAYS[i] == d) return true;
+   return false;
+}
+
+CTrade   trade;
+double   g_initBal = 0;
+int      g_dayKey = 0;
+double   g_dayStart = 0;
+datetime g_lastBar = 0;
+int      g_tradedKey = 0;            // NY date (yyyymmdd) of the last entry
+double   g_riskUsd[];                // tester export: money at risk of each entry, in order
+bool     g_announced = false;
+string   g_closeReason = "";
+
+string GV(const string k, long magic) { return StringFormat("GTB_%I64d_%I64d_%s", magic, AccountInfoInteger(ACCOUNT_LOGIN), k); }
+double GVGet(const string k, double def) { return GlobalVariableCheck(GV(k, InpMagic)) ? GlobalVariableGet(GV(k, InpMagic)) : def; }
+void   GVSet(const string k, double v) { GlobalVariableSet(GV(k, InpMagic), v); GlobalVariablesFlush(); }
+bool   IsTester() { return (bool)MQLInfoInteger(MQL_TESTER); }
+datetime ToNY(datetime s) { return s - InpServerMinusNY * 3600; }
+int    NYKey(datetime s) { MqlDateTime d; TimeToStruct(ToNY(s), d); return d.year * 10000 + d.mon * 100 + d.day; }
+int    NYMinutes(datetime s) { MqlDateTime d; TimeToStruct(ToNY(s), d); return d.hour * 60 + d.min; }
+int    PragueKey(datetime s) { MqlDateTime d; TimeToStruct(s - InpServerMinusPrague * 3600, d); return d.year * 10000 + d.mon * 100 + d.day; }
+
+void LogEvent(const string kind, const string msg)
+{
+   Print(kind, ": ", msg);
+   if(!InpEventLog || IsTester()) return;
+   int h = FileOpen("GoldBreakout\\events.log", FILE_READ | FILE_WRITE | FILE_TXT | FILE_COMMON | FILE_SHARE_READ | FILE_ANSI);
+   if(h == INVALID_HANDLE) return;
+   FileSeek(h, 0, SEEK_END);
+   FileWriteString(h, StringFormat("%s|%s|%s|%s\n", TimeToString(TimeGMT(), TIME_DATE | TIME_SECONDS), kind, _Symbol, msg));
+   FileClose(h);
+}
+
+bool Halted()
+{
+   if(IsTester()) return false;
+   return FileIsExist("GoldBreakout\\halt.flag", FILE_COMMON);
+}
+
+// Gold EA's regime from its heartbeat (written every minute). Unknown or stale -> not BAD (no trade).
+bool GoldBad()
+{
+   if(InpGate == GATE_ALWAYS) return true;
+   if(IsTester()) return true;
+   int h = FileOpen("GoldBreakout\\heartbeat.txt", FILE_READ | FILE_TXT | FILE_COMMON | FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_ANSI);
+   if(h == INVALID_HANDLE) return false;
+   bool bad = false; datetime hb = 0;
+   while(!FileIsEnding(h))
+   {
+      string ln = FileReadString(h);
+      if(StringFind(ln, "regime=bad") == 0) bad = true;
+      if(StringFind(ln, "time_gmt=") == 0) hb = StringToTime(StringSubstr(ln, 9));
+   }
+   FileClose(h);
+   if(hb == 0 || TimeGMT() - hb > 600) return false;   // gold EA not alive -> do not trade
+   return bad;
+}
+
+//+------------------------------------------------------------------+
+double LossPerLot(double dist)
+{
+   MqlTick t;
+   if(!SymbolInfoTick(_Symbol, t) || dist <= 0) return 0;
+   double price = t.ask > 0 ? t.ask : t.bid, pnl = 0;
+   if(!OrderCalcProfit(ORDER_TYPE_BUY, _Symbol, 1.0, price, price - dist, pnl)) return 0;
+   return MathAbs(pnl);
+}
+
+double LotsFor(double riskPct, double dist, double &takenPct)
+{
+   takenPct = 0;
+   double lpl = LossPerLot(dist);
+   if(lpl <= 0 || g_initBal <= 0) return 0;
+   double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP), vmin = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double lots = MathFloor(g_initBal * riskPct / 100.0 / lpl / step) * step;
+   if(lots < vmin) return 0;                      // never round a trade UP beyond its risk
+   lots = MathMin(lots, SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX));
+   lots = NormalizeDouble(lots, 2);
+   takenPct = lots * lpl / g_initBal * 100;
+   return lots;
+}
+
+double RiskNow()
+{
+   if(InpFixedRisk) return InpFixedRiskPct;
+   double totalLoss = (g_initBal - AccountInfoDouble(ACCOUNT_EQUITY)) / g_initBal * 100;
+   return MathMax(MathMin(InpMaxRiskPct, (InpTotalLimitPct - totalLoss) / InpRiskDivisor), InpMinRiskPct) * InpRiskMult;
+}
+
+// Open risk of every position on the account (% of initial balance): loss if each stop is hit from here.
+// A position without a stop counts its whole current value at risk of 2% of price as a safety margin.
+double OpenRiskAll()
+{
+   double sum = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong tk = PositionGetTicket(i);
+      if(tk == 0) continue;
+      string sym = PositionGetString(POSITION_SYMBOL);
+      double vol = PositionGetDouble(POSITION_VOLUME), sl = PositionGetDouble(POSITION_SL), cur = PositionGetDouble(POSITION_PRICE_CURRENT);
+      bool isLong = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY;
+      double to = sl > 0 ? sl : (isLong ? cur * 0.98 : cur * 1.02);
+      double pnl = 0;
+      if(OrderCalcProfit(isLong ? ORDER_TYPE_BUY : ORDER_TYPE_SELL, sym, vol, cur, to, pnl) && pnl < 0) sum += -pnl;
+   }
+   return g_initBal > 0 ? sum / g_initBal * 100 : 0;
+}
+
+int MyPositions(int &dir)
+{
+   int n = 0; dir = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong tk = PositionGetTicket(i);
+      if(tk == 0 || PositionGetString(POSITION_SYMBOL) != _Symbol || PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+      n++; dir = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ? 1 : -1;
+   }
+   return n;
+}
+
+void CloseMine(const string reason)
+{
+   bool any = false;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong tk = PositionGetTicket(i);
+      if(tk == 0 || PositionGetString(POSITION_SYMBOL) != _Symbol || PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+      any = true;
+      if(!trade.PositionClose(tk)) LogEvent("ERROR", StringFormat("close %I64u failed: %d %s", tk, trade.ResultRetcode(), trade.ResultRetcodeDescription()));
+   }
+   if(any) { g_closeReason = reason; LogEvent("EXIT", reason); }
+}
+
+void UpdateDay()
+{
+   int key = PragueKey(TimeCurrent());
+   if(key == g_dayKey) return;
+   g_dayKey = key;
+   // share the gold EA's day start when it already set one for today (both measure the same account)
+   string gk = GV("dayKey", InpGoldMagic), gs = GV("dayStart", InpGoldMagic);
+   if(GlobalVariableCheck(gk) && (int)GlobalVariableGet(gk) == key && GlobalVariableCheck(gs)) g_dayStart = GlobalVariableGet(gs);
+   else g_dayStart = MathMax(AccountInfoDouble(ACCOUNT_BALANCE), AccountInfoDouble(ACCOUNT_EQUITY));
+   GVSet("dayKey", g_dayKey); GVSet("dayStart", g_dayStart);
+}
+
+void Losses(double &dayLoss, double &totalLoss)
+{
+   double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+   dayLoss = (g_dayStart - eq) / g_initBal * 100;
+   totalLoss = (g_initBal - eq) / g_initBal * 100;
+}
+
+bool EnsureInitialBalance()
+{
+   if(g_initBal > 0) return true;
+   if(InpInitialBalance > 0) { g_initBal = InpInitialBalance; return true; }
+   string gk = GV("initBal", InpGoldMagic);
+   if(GlobalVariableCheck(gk) && GlobalVariableGet(gk) > 0) g_initBal = GlobalVariableGet(gk);
+   else if(GVGet("initBal", 0) > 0) g_initBal = GVGet("initBal", 0);
+   else
+   {
+      double b = AccountInfoDouble(ACCOUNT_BALANCE);
+      if(b <= 0 || AccountInfoInteger(ACCOUNT_LOGIN) == 0) return false;
+      g_initBal = b;
+   }
+   GVSet("initBal", g_initBal);
+   return true;
+}
+
+// Cash-session (09:30-16:00 NY) ATR(14, RMA) from M15 bars of the last ~60 sessions, before today.
+double CashAtr()
+{
+   MqlRates r[];
+   int n = CopyRates(_Symbol, PERIOD_M15, 0, 96 * 90, r);
+   if(n < 96 * 20) return 0;
+   int today = NYKey(TimeCurrent());
+   double atr = 0, prevC = 0; bool seeded = false;
+   int curKey = 0; double h = 0, l = 0, c = 0;
+   for(int i = 0; i <= n; i++)
+   {
+      bool flush = i == n;
+      int key = 0, m = 0;
+      if(!flush) { key = NYKey(r[i].time); m = NYMinutes(r[i].time); if(m < 570 || m >= 960 || key >= today) continue; }
+      if(flush || key != curKey)
+      {
+         if(curKey != 0)
+         {
+            double tr = prevC > 0 ? MathMax(h - l, MathMax(MathAbs(h - prevC), MathAbs(l - prevC))) : h - l;
+            atr = seeded ? atr + (tr - atr) / 14.0 : tr; seeded = true; prevC = c;
+         }
+         if(flush) break;
+         curKey = key; h = r[i].high; l = r[i].low;
+      }
+      h = MathMax(h, r[i].high); l = MathMin(l, r[i].low); c = r[i].close;
+   }
+   return atr;
+}
+
+int NthWeekday(int y, int m, int wd, int n)      // day of month of the n-th weekday wd (0=Sun) of y/m; n=-1: last
+{
+   MqlDateTime d; d.year = y; d.mon = m; d.day = 1; d.hour = 0; d.min = 0; d.sec = 0;
+   datetime first = StructToTime(d); TimeToStruct(first, d);
+   int day = 1 + (wd - d.day_of_week + 7) % 7 + 7 * (n - 1);
+   if(n == -1)
+   {
+      int dim = 31; MqlDateTime e; e.year = y; e.mon = m; e.day = 31; e.hour = 0; e.min = 0; e.sec = 0;
+      while(dim > 28) { e.day = dim; TimeToStruct(StructToTime(e), e); if(e.mon == m) break; dim--; e.year = y; e.mon = m; }
+      day = 1 + (wd - d.day_of_week + 7) % 7; while(day + 7 <= dim) day += 7;
+   }
+   return day;
+}
+
+int EasterDay(int y, int &mon)                   // Anonymous Gregorian algorithm
+{
+   int a = y % 19, b = y / 100, c = y % 100, d = b / 4, e = b % 4, f = (b + 8) / 25, g = (b - f + 1) / 3;
+   int h = (19 * a + b - d - g + 15) % 30, i = c / 4, k = c % 4, l = (32 + 2 * e + 2 * i - h - k) % 7, m = (a + 11 * h + 22 * l) / 451;
+   mon = (h + l - 7 * m + 114) / 31;
+   return ((h + l - 7 * m + 114) % 31) + 1;
+}
+
+bool Observed(int y, int m, int dd, int mon, int day, int wd)   // fixed-date holiday, Sat -> Fri, Sun -> Mon
+{
+   if(mon == m && day == dd && wd >= 1 && wd <= 5) return true;
+   if(wd == 5 && mon == m && day == dd - 1) return true;   // Saturday holiday observed Friday
+   if(wd == 1 && mon == m && day == dd + 1) return true;   // Sunday holiday observed Monday
+   return false;
+}
+
+// US equity market closed or closing early (13:00 NY) on this New York date: no trade (the index CFD halts early).
+bool UsNoTradeDay(datetime server)
+{
+   MqlDateTime t; TimeToStruct(ToNY(server), t);
+   int y = t.year, mon = t.mon, day = t.day, wd = t.day_of_week;
+   if(mon == 1 && (day == 1 || (day == 2 && wd == 1))) return true;                 // New Year
+   if(mon == 1 && wd == 1 && day == NthWeekday(y, 1, 1, 3)) return true;            // MLK
+   if(mon == 2 && wd == 1 && day == NthWeekday(y, 2, 1, 3)) return true;            // Presidents
+   int em; int ed = EasterDay(y, em);                                                 // Good Friday
+   MqlDateTime es; es.year = y; es.mon = em; es.day = ed; es.hour = 0; es.min = 0; es.sec = 0;
+   MqlDateTime gf; TimeToStruct(StructToTime(es) - 2 * 86400, gf);
+   if(mon == gf.mon && day == gf.day) return true;
+   if(mon == 5 && wd == 1 && day == NthWeekday(y, 5, 1, -1)) return true;           // Memorial
+   if(y >= 2022 && Observed(y, 6, 19, mon, day, wd)) return true;                    // Juneteenth
+   if(Observed(y, 7, 4, mon, day, wd)) return true;                                  // Independence Day
+   if(mon == 7 && day == 3 && wd >= 1 && wd <= 4) return true;                       // early close Jul 3
+   if(mon == 9 && wd == 1 && day == NthWeekday(y, 9, 1, 1)) return true;            // Labor
+   int tg = NthWeekday(y, 11, 4, 4);
+   if(mon == 11 && (day == tg || day == tg + 1)) return true;                        // Thanksgiving + day after
+   if(Observed(y, 12, 25, mon, day, wd)) return true;                                // Christmas
+   if(mon == 12 && day == 24 && wd >= 1 && wd <= 5) return true;                     // early close Dec 24
+   return false;
+}
+
+//+------------------------------------------------------------------+
+void Guards()
+{
+   if(!EnsureInitialBalance()) return;
+   UpdateDay();
+   int dir; int n = MyPositions(dir);
+   if(Halted()) { if(n > 0) CloseMine("Halt switch"); return; }
+   if(n == 0) return;
+   double dayLoss, totalLoss; Losses(dayLoss, totalLoss);
+   if(InpPropRules && (dayLoss >= InpDailyLimitPct || totalLoss >= InpTotalLimitPct)) { CloseMine(dayLoss >= InpDailyLimitPct ? "Daily loss limit" : "Max loss limit"); return; }
+   int m = NYMinutes(TimeCurrent());
+   if(m >= InpExitHour * 60 + InpExitMinute || m < 9 * 60) CloseMine("Session exit");
+}
+
+void TryEntry()
+{
+   // runs on the first tick of a new M15 bar: bar 1 must be the 09:30 NY candle of today
+   datetime t1 = iTime(_Symbol, PERIOD_M15, 1);
+   if(t1 == 0 || NYMinutes(t1) != 570 || NYKey(t1) != NYKey(TimeCurrent())) return;
+   int today = NYKey(t1);
+   if(g_tradedKey == today || UsNoTradeDay(t1) || Halted()) return;
+   if(InpSkipFomc && FomcDay(t1)) { if(g_tradedKey != today) LogEvent("SKIP", "Fed decision day - no Nasdaq trade"); g_tradedKey = today; return; }
+   g_tradedKey = today; GVSet("tradedKey", today);
+   int dir0; if(MyPositions(dir0) > 0) return;
+   double o = iOpen(_Symbol, PERIOD_M15, 1), c = iClose(_Symbol, PERIOD_M15, 1), hi = iHigh(_Symbol, PERIOD_M15, 1), lo = iLow(_Symbol, PERIOD_M15, 1);
+   if(c == o) return;
+   if(!GoldBad()) { LogEvent("SKIP", "gold regime is GOOD (or gold EA silent) - no Nasdaq trade today"); return; }
+   int dir = c > o ? 1 : -1;
+   double atr = CashAtr();
+   MqlTick t; if(!SymbolInfoTick(_Symbol, t) || atr <= 0) { LogEvent("WARNING", "no cash ATR / tick - skipped"); return; }
+   double px = dir == 1 ? t.ask : t.bid;
+   double sl = dir == 1 ? lo : hi;
+   if((px - sl) * dir < InpStopFloorAtr * atr) sl = px - dir * InpStopFloorAtr * atr;
+   sl = NormalizeDouble(sl, _Digits);
+   double dist = (px - sl) * dir;
+   if(dist <= 0) return;
+   double taken, risk = RiskNow();
+   double lots = LotsFor(risk, dist, taken);
+   double dayLoss, totalLoss; Losses(dayLoss, totalLoss);
+   double open = OpenRiskAll();
+   bool fits = !InpPropRules || (dayLoss + open + taken <= InpDailyLimitPct && totalLoss + open + taken <= InpTotalLimitPct);
+   if(InpProfitTarget > 0 && -totalLoss >= InpProfitTarget) { LogEvent("SKIP", "profit target reached - no new trades"); return; }
+   if(lots <= 0 || !fits) { LogEvent("SKIP", StringFormat("risk does not fit (day %.2f%% + open %.2f%% + new %.2f%%)", dayLoss, open, taken)); return; }
+   bool ok = dir == 1 ? trade.Buy(lots, _Symbol, 0, sl, 0, "NQ ORB") : trade.Sell(lots, _Symbol, 0, sl, 0, "NQ ORB");
+   if(ok && IsTester()) { int k = ArraySize(g_riskUsd); ArrayResize(g_riskUsd, k + 1); g_riskUsd[k] = lots * LossPerLot(dist); }
+   if(ok) LogEvent("ENTRY", StringFormat("%s %.2f lots US100 at %.2f, stop %.2f (%.2f%% risk, cash ATR %.1f)", dir == 1 ? "BUY" : "SELL", lots, px, sl, taken, atr));
+   else LogEvent("ERROR", StringFormat("entry failed: %d %s", trade.ResultRetcode(), trade.ResultRetcodeDescription()));
+}
+
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   trade.SetExpertMagicNumber(InpMagic);
+   trade.SetDeviationInPoints(InpDeviationPts);
+   trade.SetTypeFillingBySymbol(_Symbol);
+   if(IsTester()) { GlobalVariablesDeleteAll(StringFormat("GTB_%I64d_", InpMagic)); g_initBal = InpInitialBalance > 0 ? InpInitialBalance : AccountInfoDouble(ACCOUNT_BALANCE); }
+   g_tradedKey = (int)GVGet("tradedKey", 0);
+   if(!IsTester()) EventSetTimer(30);
+   LogEvent("START", StringFormat("%s Nasdaq ORB, gate %s, risk %.2fx of max %.2f%%, guards %.1f%%/%.1f%%, FOMC days %s", _Symbol,
+            InpGate == GATE_GOLD_BAD ? "gold BAD only" : "always", InpRiskMult, InpMaxRiskPct, InpDailyLimitPct, InpTotalLimitPct, InpSkipFomc ? "skipped" : "traded"));
+   return INIT_SUCCEEDED;
+}
+
+// Tester: every round trip with its R (profit / money at risk at entry), New York times.
+void ExportTrades()
+{
+   if(!HistorySelect(0, TimeCurrent())) return;
+   int h = FileOpen("GoldBreakout\\nasdaq_tester_trades.csv", FILE_WRITE | FILE_TXT | FILE_COMMON | FILE_ANSI);
+   if(h == INVALID_HANDLE) return;
+   FileWriteString(h, "entry_time_ny;exit_time_ny;dir;entry;exit;lots;profit;risk_usd;r\n");
+   int k = 0; datetime et = 0; double ep = 0, lots = 0; int dir = 0;
+   for(int i = 0; i < HistoryDealsTotal(); i++)
+   {
+      ulong d = HistoryDealGetTicket(i);
+      if(HistoryDealGetInteger(d, DEAL_MAGIC) != InpMagic) continue;
+      long en = HistoryDealGetInteger(d, DEAL_ENTRY);
+      if(en == DEAL_ENTRY_IN) { et = (datetime)HistoryDealGetInteger(d, DEAL_TIME); ep = HistoryDealGetDouble(d, DEAL_PRICE); lots = HistoryDealGetDouble(d, DEAL_VOLUME); dir = HistoryDealGetInteger(d, DEAL_TYPE) == DEAL_TYPE_BUY ? 1 : -1; }
+      else if(en == DEAL_ENTRY_OUT && et > 0)
+      {
+         double pnl = HistoryDealGetDouble(d, DEAL_PROFIT) + HistoryDealGetDouble(d, DEAL_COMMISSION) + HistoryDealGetDouble(d, DEAL_SWAP);
+         double ru = k < ArraySize(g_riskUsd) ? g_riskUsd[k] : 0; k++;
+         FileWriteString(h, StringFormat("%s;%s;%s;%.2f;%.2f;%.2f;%.2f;%.2f;%.3f\n", TimeToString(ToNY(et), TIME_DATE | TIME_MINUTES),
+                         TimeToString(ToNY((datetime)HistoryDealGetInteger(d, DEAL_TIME)), TIME_DATE | TIME_MINUTES), dir == 1 ? "L" : "S",
+                         ep, HistoryDealGetDouble(d, DEAL_PRICE), lots, pnl, ru, ru > 0 ? pnl / ru : 0));
+         et = 0;
+      }
+   }
+   FileClose(h);
+}
+
+void OnDeinit(const int reason) { EventKillTimer(); if(IsTester()) ExportTrades(); }
+
+// Every fill of this EA reaches Telegram: entries with price, closes with P/L and the reason
+// (a stop-loss hit on the server is reported here too - it has no other trace in the EA).
+void OnTradeTransaction(const MqlTradeTransaction &tr, const MqlTradeRequest &rq, const MqlTradeResult &rs)
+{
+   if(tr.type != TRADE_TRANSACTION_DEAL_ADD || !HistoryDealSelect(tr.deal)) return;
+   if(HistoryDealGetInteger(tr.deal, DEAL_MAGIC) != InpMagic || HistoryDealGetString(tr.deal, DEAL_SYMBOL) != _Symbol) return;
+   long entry = HistoryDealGetInteger(tr.deal, DEAL_ENTRY);
+   if(entry == DEAL_ENTRY_IN)
+      LogEvent("FILL", StringFormat("%s %.2f lots at %.2f", HistoryDealGetInteger(tr.deal, DEAL_TYPE) == DEAL_TYPE_BUY ? "BUY" : "SELL",
+               HistoryDealGetDouble(tr.deal, DEAL_VOLUME), HistoryDealGetDouble(tr.deal, DEAL_PRICE)));
+   else if(entry == DEAL_ENTRY_OUT)
+   {
+      long why = HistoryDealGetInteger(tr.deal, DEAL_REASON);
+      double pnl = HistoryDealGetDouble(tr.deal, DEAL_PROFIT) + HistoryDealGetDouble(tr.deal, DEAL_COMMISSION) + HistoryDealGetDouble(tr.deal, DEAL_SWAP);
+      string r = why == DEAL_REASON_SL ? "Stop" : g_closeReason != "" ? g_closeReason : "Close";
+      LogEvent("CLOSE", StringFormat("%.2f lots at %.2f, P/L %.2f %s (%s)", HistoryDealGetDouble(tr.deal, DEAL_VOLUME),
+               HistoryDealGetDouble(tr.deal, DEAL_PRICE), pnl, AccountInfoString(ACCOUNT_CURRENCY), r));
+      g_closeReason = "";
+   }
+}
+
+void OnTimer()
+{
+   if(TerminalInfoInteger(TERMINAL_CONNECTED) && EnsureInitialBalance() && !g_announced) { g_announced = true; LogEvent("START", StringFormat("initial balance %.2f", g_initBal)); }
+   if(TerminalInfoInteger(TERMINAL_CONNECTED)) Guards();
+   if(IsTester()) return;
+   int h = FileOpen("GoldBreakout\\nasdaq_heartbeat.txt", FILE_WRITE | FILE_TXT | FILE_COMMON | FILE_ANSI);
+   if(h == INVALID_HANDLE) return;
+   int dir; int n = MyPositions(dir);
+   FileWriteString(h, StringFormat("time_gmt=%s\nsymbol=%s\npositions=%d\ndirection=%d\ngold_bad=%d\ninitial_balance=%.2f\n",
+                   TimeToString(TimeGMT(), TIME_DATE | TIME_SECONDS), _Symbol, n, dir, (int)GoldBad(), g_initBal));
+   FileClose(h);
+}
+
+void OnTick()
+{
+   if(!EnsureInitialBalance()) return;
+   Guards();
+   datetime b = iTime(_Symbol, PERIOD_M15, 0);
+   if(b != g_lastBar) { g_lastBar = b; TryEntry(); }
+}

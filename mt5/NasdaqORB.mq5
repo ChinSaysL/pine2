@@ -18,11 +18,17 @@ enum ENUM_GATE { GATE_ALWAYS = 0, GATE_GOLD_BAD = 1 };
 input group "SIGNAL"
 input int    InpRangeMinutes   = 15;    // Opening range (minutes after 09:30 NY) - M15 candle
 input double InpStopFloorAtr   = 0.3;   // Minimum stop distance (x cash-session ATR 14)
+input double InpMinBodyFrac    = 0.2;   // Skip when the opening candle's body < this x its range (indecisive open; research: weakest trades in every period, -17.8R in 2026)
 input int    InpExitHour       = 15;    // Exit time, New York
 input int    InpExitMinute     = 55;
 input ENUM_GATE InpGate        = GATE_ALWAYS;   // Trade always (research: its edge does not depend on gold's regime), or only while gold is BAD
 input double InpRiskMult       = 0.75;  // Risk multiplier vs the gold EA's risk (0.75 = best pass rates with gold in research)
 input bool   InpSkipFomc       = true;  // No trade on Fed decision days (14:00 NY statement inside the holding window)
+input bool   InpReverseOnce    = false;  // Opening trade stopped before InpReverseUntil -> reverse once (research: +7pt pass rate when gold is BAD)
+input int    InpReverseUntil   = 12;    // ...only if stopped before this New York hour
+input bool   InpNoiseEngine    = true;  // Second engine: noise-area momentum (Zarattini, Barbon & Aziz 2024)
+input double InpNoiseRiskMult  = 0.75;  // Its risk multiplier vs the gold EA's risk (like InpRiskMult)
+input int    InpNoiseDays      = 14;    // Sessions averaged for the noise band
 
 input group "RISK (same scheme as the gold EA)"
 input double InpMaxRiskPct     = 1.25;  // Max risk per trade (% of initial balance)
@@ -71,10 +77,17 @@ double   g_initBal = 0;
 int      g_dayKey = 0;
 double   g_dayStart = 0;
 datetime g_lastBar = 0;
+datetime g_lastBar5 = 0;
 int      g_tradedKey = 0;            // NY date (yyyymmdd) of the last entry
 double   g_riskUsd[];                // tester export: money at risk of each entry, in order
 bool     g_announced = false;
 string   g_closeReason = "";
+int      g_orDay = 0, g_orDir = 0, g_revDay = 0;   // opening range of the day, for the reversal
+double   g_orHi = 0, g_orLo = 0, g_orAtr = 0;
+ulong    g_orbPos = 0;                     // position id of today's opening trade
+bool     g_wantReverse = false;
+int      g_noiseDay = 0;                   // NY date of today's noise trade
+ulong    g_riskOrder[];                    // tester export: order ticket of each entry (pairs with g_riskUsd)
 
 string GV(const string k, long magic) { return StringFormat("GTB_%I64d_%I64d_%s", magic, AccountInfoInteger(ACCOUNT_LOGIN), k); }
 double GVGet(const string k, double def) { return GlobalVariableCheck(GV(k, InpMagic)) ? GlobalVariableGet(GV(k, InpMagic)) : def; }
@@ -329,6 +342,131 @@ void Guards()
    if(m >= InpExitHour * 60 + InpExitMinute || m < 9 * 60) CloseMine("Session exit");
 }
 
+// This EA's positions whose comment contains tag.
+int TagPositions(const string tag, int &dir)
+{
+   int n = 0; dir = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong tk = PositionGetTicket(i);
+      if(tk == 0 || PositionGetString(POSITION_SYMBOL) != _Symbol || PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+      if(StringFind(PositionGetString(POSITION_COMMENT), tag) < 0) continue;
+      n++; dir = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ? 1 : -1;
+   }
+   return n;
+}
+
+void CloseTag(const string tag, const string reason)
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong tk = PositionGetTicket(i);
+      if(tk == 0 || PositionGetString(POSITION_SYMBOL) != _Symbol || PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+      if(StringFind(PositionGetString(POSITION_COMMENT), tag) < 0) continue;
+      g_closeReason = reason;
+      if(!trade.PositionClose(tk)) LogEvent("ERROR", StringFormat("close %I64u failed: %d %s", tk, trade.ResultRetcode(), trade.ResultRetcodeDescription()));
+      else LogEvent("EXIT", reason);
+   }
+}
+
+// NOISE-AREA ENGINE (Zarattini, Barbon & Aziz 2024). On each M5 bar ending on :00 / :30 New York time: the noise
+// band at that time of day = the 09:30 open (upper band from max(open, previous close), lower from min(open,
+// previous close)) +- the average absolute move from the open at the same time over the last InpNoiseDays full
+// sessions. 10:00-15:00: a close outside the band opens one trade that day in that direction, hard stop at the band
+// or the VWAP (whichever is farther, at least InpStopFloorAtr x cash ATR). Every half hour: back inside the band or
+// across the VWAP -> close. 15:55 session exit, loss guards, Fed days and US holidays as for the opening trade.
+void NoiseEngine()
+{
+   if(!InpNoiseEngine) return;
+   datetime t1 = iTime(_Symbol, PERIOD_M5, 1);
+   if(t1 == 0 || NYKey(t1) != NYKey(TimeCurrent())) return;
+   int endm = NYMinutes(t1) + 5;
+   if(endm < 600 || endm > 930 || endm % 30 != 0) return;
+   int today = NYKey(t1);
+   if(UsNoTradeDay(t1) || (InpSkipFomc && FomcDay(t1)) || Halted()) return;
+   int ndir;
+   bool open = TagPositions("NQ NOISE", ndir) > 0;
+   if(!open && (g_noiseDay == today || endm > 900)) return;
+   MqlRates r[];
+   int n = CopyRates(_Symbol, PERIOD_M5, 0, 288 * (InpNoiseDays + 12), r);
+   if(n < 288 * (InpNoiseDays + 2)) return;
+   int keys[], firstIdx[], cnt[];
+   for(int i = 0; i < n - 1; i++)                              // the last element is the forming bar
+   {
+      int m = NYMinutes(r[i].time);
+      if(m < 570 || m >= 960) continue;
+      int key = NYKey(r[i].time), k = ArraySize(keys);
+      if(k == 0 || keys[k - 1] != key)
+      {
+         ArrayResize(keys, k + 1); ArrayResize(firstIdx, k + 1); ArrayResize(cnt, k + 1);
+         keys[k] = key; firstIdx[k] = i; cnt[k] = 0;
+      }
+      cnt[ArraySize(keys) - 1]++;
+   }
+   int nk = ArraySize(keys);
+   if(nk < InpNoiseDays + 2 || keys[nk - 1] != today || NYMinutes(r[firstIdx[nk - 1]].time) != 570) return;
+   int ti = nk - 1, pos = (endm - 5 - 570) / 5;                  // bar 1's index within today's session
+   if(cnt[ti] < pos + 1) return;
+   double o0 = r[firstIdx[ti]].open;
+   int pi = ti - 1;
+   double pc = r[firstIdx[pi] + cnt[pi] - 1].close;               // previous session's last close
+   double sum = 0;
+   int used = 0;
+   for(int j = ti - 1; j >= 0 && used < InpNoiseDays; j--)
+   {
+      if(cnt[j] < 78 || NYMinutes(r[firstIdx[j]].time) != 570) continue;
+      sum += MathAbs(r[firstIdx[j] + pos].close / r[firstIdx[j]].open - 1.0);
+      used++;
+   }
+   if(used < 10) return;
+   double sig = sum / used;
+   double ub = MathMax(o0, pc) * (1 + sig), lb = MathMin(o0, pc) * (1 - sig);
+   double pv = 0, vv = 0;
+   for(int i = firstIdx[ti]; i <= firstIdx[ti] + pos; i++)
+   {
+      double v = r[i].tick_volume > 0 ? (double)r[i].tick_volume : 1.0;
+      pv += (r[i].high + r[i].low + r[i].close) / 3.0 * v;
+      vv += v;
+   }
+   double vwap = pv / vv, c = r[firstIdx[ti] + pos].close;
+   if(open)
+   {
+      double trail = ndir == 1 ? MathMax(ub, vwap) : MathMin(lb, vwap);
+      if((c - trail) * ndir < 0) CloseTag("NQ NOISE", "Noise exit (back inside the band / VWAP)");
+      return;
+   }
+   int dir = c > ub ? 1 : (c < lb ? -1 : 0);
+   if(dir == 0) return;
+   g_noiseDay = today; GVSet("noiseDay", today);
+   double ref = dir == 1 ? MathMin(ub, vwap) : MathMax(lb, vwap);
+   OpenTrade(dir, ref, CashAtr(), InpNoiseRiskMult / MathMax(InpRiskMult, 0.01), "NQ NOISE");
+}
+
+// Opens a trade in direction dir with the stop at ref (moved to at least InpStopFloorAtr x atr from the entry),
+// sized by the account's risk rules; every check the account-wide guards need happens here. Returns true if sent.
+bool OpenTrade(int dir, double ref, double atr, double riskMult, const string comment)
+{
+   MqlTick t; if(!SymbolInfoTick(_Symbol, t) || atr <= 0) { LogEvent("WARNING", "no cash ATR / tick - skipped"); return false; }
+   double px = dir == 1 ? t.ask : t.bid;
+   double sl = ref;
+   if((px - sl) * dir < InpStopFloorAtr * atr) sl = px - dir * InpStopFloorAtr * atr;
+   sl = NormalizeDouble(sl, _Digits);
+   double dist = (px - sl) * dir;
+   if(dist <= 0) return false;
+   double taken, risk = RiskNow() * riskMult;
+   double lots = LotsFor(risk, dist, taken);
+   double dayLoss, totalLoss; Losses(dayLoss, totalLoss);
+   double open = OpenRiskAll();
+   bool fits = !InpPropRules || (dayLoss + open + taken <= InpDailyLimitPct && totalLoss + open + taken <= InpTotalLimitPct);
+   if(InpProfitTarget > 0 && -totalLoss >= InpProfitTarget) { LogEvent("SKIP", "profit target reached - no new trades"); return false; }
+   if(lots <= 0 || !fits) { LogEvent("SKIP", StringFormat("%s: risk does not fit (day %.2f%% + open %.2f%% + new %.2f%%)", comment, dayLoss, open, taken)); return false; }
+   bool ok = dir == 1 ? trade.Buy(lots, _Symbol, 0, sl, 0, comment) : trade.Sell(lots, _Symbol, 0, sl, 0, comment);
+   if(ok && IsTester()) { int k = ArraySize(g_riskUsd); ArrayResize(g_riskUsd, k + 1); ArrayResize(g_riskOrder, k + 1); g_riskUsd[k] = lots * LossPerLot(dist); g_riskOrder[k] = trade.ResultOrder(); }
+   if(ok) LogEvent("ENTRY", StringFormat("%s %s %.2f lots US100 at %.2f, stop %.2f (%.2f%% risk, cash ATR %.1f)", comment, dir == 1 ? "BUY" : "SELL", lots, px, sl, taken, atr));
+   else LogEvent("ERROR", StringFormat("%s failed: %d %s", comment, trade.ResultRetcode(), trade.ResultRetcodeDescription()));
+   return ok;
+}
+
 void TryEntry()
 {
    // runs on the first tick of a new M15 bar: bar 1 must be the 09:30 NY candle of today
@@ -338,30 +476,32 @@ void TryEntry()
    if(g_tradedKey == today || UsNoTradeDay(t1) || Halted()) return;
    if(InpSkipFomc && FomcDay(t1)) { if(g_tradedKey != today) LogEvent("SKIP", "Fed decision day - no Nasdaq trade"); g_tradedKey = today; return; }
    g_tradedKey = today; GVSet("tradedKey", today);
-   int dir0; if(MyPositions(dir0) > 0) return;
+   int dir0; if(TagPositions("NQ ORB", dir0) + TagPositions("NQ SAR", dir0) > 0) return;
    double o = iOpen(_Symbol, PERIOD_M15, 1), c = iClose(_Symbol, PERIOD_M15, 1), hi = iHigh(_Symbol, PERIOD_M15, 1), lo = iLow(_Symbol, PERIOD_M15, 1);
    if(c == o) return;
+   if(hi > lo && MathAbs(c - o) < InpMinBodyFrac * (hi - lo)) { LogEvent("SKIP", StringFormat("indecisive opening candle (body %.0f%% of its range) - no opening trade today", 100 * MathAbs(c - o) / (hi - lo))); return; }
    if(!GoldBad()) { LogEvent("SKIP", "gold regime is GOOD (or gold EA silent) - no Nasdaq trade today"); return; }
    int dir = c > o ? 1 : -1;
    double atr = CashAtr();
-   MqlTick t; if(!SymbolInfoTick(_Symbol, t) || atr <= 0) { LogEvent("WARNING", "no cash ATR / tick - skipped"); return; }
-   double px = dir == 1 ? t.ask : t.bid;
-   double sl = dir == 1 ? lo : hi;
-   if((px - sl) * dir < InpStopFloorAtr * atr) sl = px - dir * InpStopFloorAtr * atr;
-   sl = NormalizeDouble(sl, _Digits);
-   double dist = (px - sl) * dir;
-   if(dist <= 0) return;
-   double taken, risk = RiskNow();
-   double lots = LotsFor(risk, dist, taken);
-   double dayLoss, totalLoss; Losses(dayLoss, totalLoss);
-   double open = OpenRiskAll();
-   bool fits = !InpPropRules || (dayLoss + open + taken <= InpDailyLimitPct && totalLoss + open + taken <= InpTotalLimitPct);
-   if(InpProfitTarget > 0 && -totalLoss >= InpProfitTarget) { LogEvent("SKIP", "profit target reached - no new trades"); return; }
-   if(lots <= 0 || !fits) { LogEvent("SKIP", StringFormat("risk does not fit (day %.2f%% + open %.2f%% + new %.2f%%)", dayLoss, open, taken)); return; }
-   bool ok = dir == 1 ? trade.Buy(lots, _Symbol, 0, sl, 0, "NQ ORB") : trade.Sell(lots, _Symbol, 0, sl, 0, "NQ ORB");
-   if(ok && IsTester()) { int k = ArraySize(g_riskUsd); ArrayResize(g_riskUsd, k + 1); g_riskUsd[k] = lots * LossPerLot(dist); }
-   if(ok) LogEvent("ENTRY", StringFormat("%s %.2f lots US100 at %.2f, stop %.2f (%.2f%% risk, cash ATR %.1f)", dir == 1 ? "BUY" : "SELL", lots, px, sl, taken, atr));
-   else LogEvent("ERROR", StringFormat("entry failed: %d %s", trade.ResultRetcode(), trade.ResultRetcodeDescription()));
+   // remember the opening range for a possible reversal (kept across a restart)
+   g_orDay = today; g_orDir = dir; g_orHi = hi; g_orLo = lo; g_orAtr = atr;
+   GVSet("orDay", today); GVSet("orDir", dir); GVSet("orHi", hi); GVSet("orLo", lo); GVSet("orAtr", atr);
+   OpenTrade(dir, dir == 1 ? lo : hi, atr, 1.0, "NQ ORB");
+}
+
+// Stop-and-reverse once: the opening trade was stopped before InpReverseUntil (NY) -> the opening move failed;
+// trade the other way with the stop at the opening range's far side (floor 0.3 cash ATR), exit 15:55 as usual.
+void TryReverse()
+{
+   if(!g_wantReverse) return;
+   g_wantReverse = false;
+   int today = NYKey(TimeCurrent());
+   if(!InpReverseOnce || g_orDay != today || g_revDay == today || Halted()) return;
+   if(NYMinutes(TimeCurrent()) >= InpReverseUntil * 60) return;
+   int dir0; if(TagPositions("NQ ORB", dir0) + TagPositions("NQ SAR", dir0) > 0) return;
+   g_revDay = today; GVSet("revDay", today);
+   int dir = -g_orDir;
+   OpenTrade(dir, dir == 1 ? g_orLo : g_orHi, g_orAtr, 1.0, "NQ SAR");
 }
 
 //+------------------------------------------------------------------+
@@ -372,9 +512,12 @@ int OnInit()
    trade.SetTypeFillingBySymbol(_Symbol);
    if(IsTester()) { GlobalVariablesDeleteAll(StringFormat("GTB_%I64d_", InpMagic)); g_initBal = InpInitialBalance > 0 ? InpInitialBalance : AccountInfoDouble(ACCOUNT_BALANCE); }
    g_tradedKey = (int)GVGet("tradedKey", 0);
+   g_noiseDay = (int)GVGet("noiseDay", 0);
+   g_orDay = (int)GVGet("orDay", 0); g_orDir = (int)GVGet("orDir", 0); g_revDay = (int)GVGet("revDay", 0);
+   g_orHi = GVGet("orHi", 0); g_orLo = GVGet("orLo", 0); g_orAtr = GVGet("orAtr", 0);
    if(!IsTester()) EventSetTimer(30);
-   LogEvent("START", StringFormat("%s Nasdaq ORB, gate %s, risk %.2fx of max %.2f%%, guards %.1f%%/%.1f%%, FOMC days %s", _Symbol,
-            InpGate == GATE_GOLD_BAD ? "gold BAD only" : "always", InpRiskMult, InpMaxRiskPct, InpDailyLimitPct, InpTotalLimitPct, InpSkipFomc ? "skipped" : "traded"));
+   LogEvent("START", StringFormat("%s Nasdaq ORB, gate %s, risk %.2fx of max %.2f%%, guards %.1f%%/%.1f%%, FOMC days %s, reverse once %s, noise engine %s", _Symbol,
+            InpGate == GATE_GOLD_BAD ? "gold BAD only" : "always", InpRiskMult, InpMaxRiskPct, InpDailyLimitPct, InpTotalLimitPct, InpSkipFomc ? "skipped" : "traded", InpReverseOnce ? StringFormat("before %d:00 NY", InpReverseUntil) : "off", InpNoiseEngine ? StringFormat("on (%.2fx)", InpNoiseRiskMult) : "off"));
    return INIT_SUCCEEDED;
 }
 
@@ -384,23 +527,30 @@ void ExportTrades()
    if(!HistorySelect(0, TimeCurrent())) return;
    int h = FileOpen("GoldBreakout\\nasdaq_tester_trades.csv", FILE_WRITE | FILE_TXT | FILE_COMMON | FILE_ANSI);
    if(h == INVALID_HANDLE) return;
-   FileWriteString(h, "entry_time_ny;exit_time_ny;dir;entry;exit;lots;profit;risk_usd;r\n");
-   int k = 0; datetime et = 0; double ep = 0, lots = 0; int dir = 0;
+   FileWriteString(h, "entry_time_ny;exit_time_ny;dir;entry;exit;lots;profit;risk_usd;r;comment\n");
+   // pair every exit with its own entry by position id (the opening and noise trades can overlap)
    for(int i = 0; i < HistoryDealsTotal(); i++)
    {
       ulong d = HistoryDealGetTicket(i);
-      if(HistoryDealGetInteger(d, DEAL_MAGIC) != InpMagic) continue;
-      long en = HistoryDealGetInteger(d, DEAL_ENTRY);
-      if(en == DEAL_ENTRY_IN) { et = (datetime)HistoryDealGetInteger(d, DEAL_TIME); ep = HistoryDealGetDouble(d, DEAL_PRICE); lots = HistoryDealGetDouble(d, DEAL_VOLUME); dir = HistoryDealGetInteger(d, DEAL_TYPE) == DEAL_TYPE_BUY ? 1 : -1; }
-      else if(en == DEAL_ENTRY_OUT && et > 0)
+      if(HistoryDealGetInteger(d, DEAL_MAGIC) != InpMagic || HistoryDealGetInteger(d, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
+      long pid = HistoryDealGetInteger(d, DEAL_POSITION_ID);
+      ulong din = 0;
+      for(int j = 0; j < HistoryDealsTotal(); j++)
       {
-         double pnl = HistoryDealGetDouble(d, DEAL_PROFIT) + HistoryDealGetDouble(d, DEAL_COMMISSION) + HistoryDealGetDouble(d, DEAL_SWAP);
-         double ru = k < ArraySize(g_riskUsd) ? g_riskUsd[k] : 0; k++;
-         FileWriteString(h, StringFormat("%s;%s;%s;%.2f;%.2f;%.2f;%.2f;%.2f;%.3f\n", TimeToString(ToNY(et), TIME_DATE | TIME_MINUTES),
-                         TimeToString(ToNY((datetime)HistoryDealGetInteger(d, DEAL_TIME)), TIME_DATE | TIME_MINUTES), dir == 1 ? "L" : "S",
-                         ep, HistoryDealGetDouble(d, DEAL_PRICE), lots, pnl, ru, ru > 0 ? pnl / ru : 0));
-         et = 0;
+         ulong x = HistoryDealGetTicket(j);
+         if(HistoryDealGetInteger(x, DEAL_POSITION_ID) == pid && HistoryDealGetInteger(x, DEAL_ENTRY) == DEAL_ENTRY_IN) { din = x; break; }
       }
+      if(din == 0) continue;
+      ulong ord = (ulong)HistoryDealGetInteger(din, DEAL_ORDER);
+      double ru = 0;
+      for(int k = 0; k < ArraySize(g_riskOrder); k++) if(g_riskOrder[k] == ord) { ru = g_riskUsd[k]; break; }
+      double pnl = HistoryDealGetDouble(d, DEAL_PROFIT) + HistoryDealGetDouble(d, DEAL_COMMISSION) + HistoryDealGetDouble(d, DEAL_SWAP);
+      int dir = HistoryDealGetInteger(din, DEAL_TYPE) == DEAL_TYPE_BUY ? 1 : -1;
+      FileWriteString(h, StringFormat("%s;%s;%s;%.2f;%.2f;%.2f;%.2f;%.2f;%.3f;%s\n",
+                      TimeToString(ToNY((datetime)HistoryDealGetInteger(din, DEAL_TIME)), TIME_DATE | TIME_MINUTES),
+                      TimeToString(ToNY((datetime)HistoryDealGetInteger(d, DEAL_TIME)), TIME_DATE | TIME_MINUTES), dir == 1 ? "L" : "S",
+                      HistoryDealGetDouble(din, DEAL_PRICE), HistoryDealGetDouble(d, DEAL_PRICE), HistoryDealGetDouble(din, DEAL_VOLUME),
+                      pnl, ru, ru > 0 ? pnl / ru : 0, HistoryDealGetString(din, DEAL_COMMENT)));
    }
    FileClose(h);
 }
@@ -414,6 +564,7 @@ void OnTradeTransaction(const MqlTradeTransaction &tr, const MqlTradeRequest &rq
    if(tr.type != TRADE_TRANSACTION_DEAL_ADD || !HistoryDealSelect(tr.deal)) return;
    if(HistoryDealGetInteger(tr.deal, DEAL_MAGIC) != InpMagic || HistoryDealGetString(tr.deal, DEAL_SYMBOL) != _Symbol) return;
    long entry = HistoryDealGetInteger(tr.deal, DEAL_ENTRY);
+   if(entry == DEAL_ENTRY_IN && StringFind(HistoryDealGetString(tr.deal, DEAL_COMMENT), "NQ ORB") >= 0) g_orbPos = HistoryDealGetInteger(tr.deal, DEAL_POSITION_ID);
    if(entry == DEAL_ENTRY_IN)
       LogEvent("FILL", StringFormat("%s %.2f lots at %.2f", HistoryDealGetInteger(tr.deal, DEAL_TYPE) == DEAL_TYPE_BUY ? "BUY" : "SELL",
                HistoryDealGetDouble(tr.deal, DEAL_VOLUME), HistoryDealGetDouble(tr.deal, DEAL_PRICE)));
@@ -422,6 +573,8 @@ void OnTradeTransaction(const MqlTradeTransaction &tr, const MqlTradeRequest &rq
       long why = HistoryDealGetInteger(tr.deal, DEAL_REASON);
       double pnl = HistoryDealGetDouble(tr.deal, DEAL_PROFIT) + HistoryDealGetDouble(tr.deal, DEAL_COMMISSION) + HistoryDealGetDouble(tr.deal, DEAL_SWAP);
       string r = why == DEAL_REASON_SL ? "Stop" : g_closeReason != "" ? g_closeReason : "Close";
+      if(why == DEAL_REASON_SL && HistoryDealGetInteger(tr.deal, DEAL_POSITION_ID) == g_orbPos && InpReverseOnce
+         && NYMinutes((datetime)HistoryDealGetInteger(tr.deal, DEAL_TIME)) < InpReverseUntil * 60) g_wantReverse = true;
       LogEvent("CLOSE", StringFormat("%.2f lots at %.2f, P/L %.2f %s (%s)", HistoryDealGetDouble(tr.deal, DEAL_VOLUME),
                HistoryDealGetDouble(tr.deal, DEAL_PRICE), pnl, AccountInfoString(ACCOUNT_CURRENCY), r));
       g_closeReason = "";
@@ -446,5 +599,8 @@ void OnTick()
    if(!EnsureInitialBalance()) return;
    Guards();
    datetime b = iTime(_Symbol, PERIOD_M15, 0);
+   datetime b5 = iTime(_Symbol, PERIOD_M5, 0);
    if(b != g_lastBar) { g_lastBar = b; TryEntry(); }
+   TryReverse();
+   if(b5 != g_lastBar5) { g_lastBar5 = b5; NoiseEngine(); }
 }

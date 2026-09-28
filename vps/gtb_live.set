@@ -1,4 +1,4 @@
-; Gold Trend Breakout - live settings (v2, 2026-09-27: 1.25% cap, guards 7% / 3.5%, bad regime = half risk). Edit, then: systemctl restart gtb-mt5
+; Gold Trend Breakout - live settings (v2, 2026-09-27: 1.25% cap, guards 8% total / 2.5% daily, bad regime = half risk). Edit, then: systemctl restart gtb-mt5
 ; InpInitialBalance: the account's STARTING balance (FTMO account size), e.g. 100000.
 ;   0 = the balance when the EA is first attached (remembered afterwards).
 InpInitialBalance=10000
@@ -12,8 +12,8 @@ InpMaxRiskPct=1.25
 InpRiskDivisor=4
 InpMinRiskPct=0.25
 InpPropRules=true
-InpDailyLimitPct=3.5
-InpTotalLimitPct=7.0
+InpDailyLimitPct=2.5
+InpTotalLimitPct=8.0
 ; Challenge mode: stop trading once +InpProfitTarget % is reached with the minimum trading days.
 ; InpChallengeStart is server time (FTMO server = New York + 7h), format YYYY.MM.DD HH:MI
 InpChallengeMode=true

@@ -87,12 +87,29 @@ does not depend on gold's regime (weekly correlation with gold -0.06), and alway
 odds (30/60/90 days 31.8/50.2/61.8% vs 28.3/46.8/59.8% gated). **No trade on Fed decision days** (`InpSkipFomc`,
 FTMO news rule; those days lost -17R in research) - update `FOMC_DAYS` in the EA each year. `InpGate=1` restores the
 old mode (only while the gold EA's heartbeat says BAD). Before an entry it counts the open risk of every position on the account;
-the gold EA does the same, so both stay inside the shared 3.5% daily / 7% total guards.
+the gold EA does the same, so both stay inside the shared 2.5% daily / 8% total guards (see Account guards).
 Settings: `nq_live.set` (edit, then `bash 08_deploy_nasdaq.sh` or `systemctl restart gtb-mt5-nq`).
 For a paid account set `InpInitialBalance` in BOTH presets (the two terminals do not share global variables).
 `gtb-halt` stops both EAs. Its heartbeat: `Common/Files/GoldBreakout/nasdaq_heartbeat.txt` (shown by `gtb-status`).
 Research (FTMO data 2021-09..2026-09, MT5 tester, fixed 1%): +126R, PF 1.19, every year positive; challenge sim
 2022-23: pass 30/60/90 days 30/51/61% with Nasdaq during gold-BAD vs 14/30/37% gold alone.
+
+Since 2026-09-27 (v3) the Nasdaq EA also runs a **noise-area engine** (`InpNoiseEngine`, `InpNoiseRiskMult=0.75`;
+Zarattini, Barbon & Aziz 2024): every half hour from 10:00 to 15:00 NY, a close outside the day's noise band (09:30
+open / previous close +- the average move at that time over the last 14 sessions) opens one trade that day, hard stop
+at the band or VWAP (>= 0.3 x cash ATR), closed when price is back inside the band / across the VWAP, or at 15:55.
+FTMO tester 2021-09..2026-09 (fixed 1%): opening trade 1211 trades +143.3R, noise engine 697 trades +49.2R PF 1.23
+(positive 2021-2025, -3.2R in 2026). Stop-and-reverse is built in but off (`InpReverseOnce=false`; it lost in 2026).
+The opening trade skips indecisive openings (`InpMinBodyFrac=0.2`: 09:30-09:45 candle body < 20% of its range) -
+the weakest trades in every period (-17.8R in 2026 alone). FTMO tester: 967 opening trades +155.4R PF 1.33 (2026 +13.3R,
+was +5.2R); skipped days show on Telegram as SKIP.
+
+## Account guards (2026-09-27, both EAs - keep them equal)
+
+`InpTotalLimitPct=8.0`, `InpDailyLimitPct=2.5` in `gtb_live.set` and `nq_live.set` (FTMO: 10% / 5%). With three engines
+able to stop out on the same day, the old 7% / 3.5% breached FTMO's daily limit in 1.9% of simulated challenges under an
+extreme stress (+1R extra slippage on every stop); 8% / 2.5% never breached, passed about as often
+(31.7/51.6/63.1% in 30/60/90 days vs 32.9/50.8/61.7%) and got stuck at the guard less often (3.7% vs 6.3%).
 
 ## News rule (2026-09-27)
 
