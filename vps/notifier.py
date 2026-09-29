@@ -3,7 +3,10 @@
 
 * forwards every line of the EA's events.log to Telegram
 * alerts when the EA heartbeat is stale during market hours, when MT5 is disconnected,
-  when Algo Trading is off, or when the MT5 service is not running
+  when Algo Trading is off, when the MT5 service is not running, or when the gold EA
+  is not on the H1 chart it is built for
+* restarts gtb-mt5 / gtb-mt5-nq when their EA heartbeat stays stale (frozen terminal),
+  at most once every RESTART_COOLDOWN_MIN minutes
 * sends a daily summary shortly after the 17:00 New York close
 
 Standard library only. Telegram credentials come from /etc/gtb/telegram.env:
@@ -28,6 +31,10 @@ STATE = "/home/mt5/gtb/notifier_state.json"
 ENV = "/etc/gtb/telegram.env"
 NY = ZoneInfo("America/New_York")
 STALE_MIN = 10
+GOLD_PERIOD = os.environ.get("GTB_EXPECTED_PERIOD", "PERIOD_H1")  # the gold EA is built for H1
+AUTO_RESTART = os.environ.get("GTB_AUTO_RESTART", "1") == "1"
+RESTART_COOLDOWN_MIN = 30
+
 
 
 def load_env(path):
@@ -97,6 +104,30 @@ def service_active(name):
     return subprocess.run(["systemctl", "is-active", "--quiet", name]).returncode == 0
 
 
+def restart_service(name):
+    """Recover a terminal that is up as a service but whose EA stopped talking."""
+    try:
+        r = subprocess.run(["systemctl", "restart", name], capture_output=True, text=True, timeout=120)
+        return r.returncode == 0
+    except Exception as e:
+        print(f"restart {name} failed: {e}", flush=True)
+        return False
+
+
+def maybe_restart(st, key, service, age_min, why):
+    """One recovery restart per cooldown window, announced on Telegram."""
+    st.setdefault("restarts", {})
+    last = st["restarts"].get(key, 0)
+    if not AUTO_RESTART:
+        return
+    if time.time() - last < RESTART_COOLDOWN_MIN * 60:
+        return
+    st["restarts"][key] = time.time()
+    ok = restart_service(service)
+    send(f"🔄 {why} ({age_min:.0f} min) -> restarting {service}: {'started' if ok else 'FAILED, check the server'}")
+
+
+
 def alert_once(st, key, active, text_on, text_off=None):
     """Send text_on when a problem starts, text_off when it clears."""
     was = st["alerts"].get(key, False)
@@ -140,8 +171,16 @@ def main():
                    "✅ MT5 service is running again")
         if market_open(now) and mt5_up:
             age = (time.time() - hb["_mtime"]) / 60 if "_mtime" in hb else 1e9
+            if age > STALE_MIN:
+                maybe_restart(st, "gold", "gtb-mt5", age, "❌ Gold EA heartbeat stale")
             alert_once(st, "stale", age > STALE_MIN, f"❌ No EA heartbeat for {age:.0f} min - EA not running or terminal frozen",
                        "✅ EA heartbeat is back")
+            # the gold EA is built for H1: an M1/M15 chart silently changes the strategy
+            period = hb.get("period", "")
+            alert_once(st, "period", bool(period) and period != GOLD_PERIOD,
+                       f"❌ The gold EA is running on {period} instead of {GOLD_PERIOD} - restart gtb-mt5 and check the chart",
+                       "✅ The gold EA is back on the expected timeframe")
+
         # Nasdaq companion: its own MT5 service and heartbeat (written every 30 s, market open or not)
         if os.path.exists("/etc/systemd/system/gtb-mt5-nq.service"):
             nq_up = service_active("gtb-mt5-nq")
@@ -149,8 +188,11 @@ def main():
                        "✅ Nasdaq MT5 service is running again")
             nq = read_heartbeat(NQ_HEARTBEAT)
             nq_age = (time.time() - nq["_mtime"]) / 60 if "_mtime" in nq else 1e9
+            if nq_up and nq_age > STALE_MIN:
+                maybe_restart(st, "nq", "gtb-mt5-nq", nq_age, "❌ Nasdaq EA heartbeat stale")
             alert_once(st, "nq_stale", nq_up and nq_age > STALE_MIN, f"❌ No Nasdaq EA heartbeat for {nq_age:.0f} min - EA not running or terminal frozen",
                        "✅ Nasdaq EA heartbeat is back")
+
             alert_once(st, "disconnected", hb.get("connected") == "0", "❌ MT5 is disconnected from the broker",
                        "✅ MT5 reconnected")
             algo_off = hb.get("terminal_trade_allowed") == "0" or hb.get("ea_trade_allowed") == "0"

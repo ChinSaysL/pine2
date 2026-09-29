@@ -78,6 +78,7 @@ int      g_dayKey = 0;
 double   g_dayStart = 0;
 datetime g_lastBar = 0;
 datetime g_lastBar5 = 0;
+datetime g_lastEntryAttempt = 0;    // throttle recoverable order attempts inside the ORB window
 int      g_tradedKey = 0;            // NY date (yyyymmdd) of the last entry
 double   g_riskUsd[];                // tester export: money at risk of each entry, in order
 bool     g_announced = false;
@@ -469,24 +470,35 @@ bool OpenTrade(int dir, double ref, double atr, double riskMult, const string co
 
 void TryEntry()
 {
-   // runs on the first tick of a new M15 bar: bar 1 must be the 09:30 NY candle of today
+   // Evaluate throughout the 09:45-10:00 NY window so a missed boundary tick or
+   // a briefly stale gold heartbeat does not permanently suppress the day's entry.
    datetime t1 = iTime(_Symbol, PERIOD_M15, 1);
-   if(t1 == 0 || NYMinutes(t1) != 570 || NYKey(t1) != NYKey(TimeCurrent())) return;
+   int nowm = NYMinutes(TimeCurrent());
+   if(t1 == 0 || NYMinutes(t1) != 570 || NYKey(t1) != NYKey(TimeCurrent()) || nowm < 585 || nowm >= 600) return;
    int today = NYKey(t1);
-   if(g_tradedKey == today || UsNoTradeDay(t1) || Halted()) return;
-   if(InpSkipFomc && FomcDay(t1)) { if(g_tradedKey != today) LogEvent("SKIP", "Fed decision day - no Nasdaq trade"); g_tradedKey = today; return; }
-   g_tradedKey = today; GVSet("tradedKey", today);
+   if(g_tradedKey == today) return;
+   // OnTick and OnTimer can both call this function.  Keep the retry bounded if the
+   // broker temporarily rejects an otherwise valid entry (requote, no prices, etc.).
+   if(g_lastEntryAttempt > 0 && TimeCurrent() - g_lastEntryAttempt < 30) return;
+   if(UsNoTradeDay(t1)) { LogEvent("SKIP", "US market holiday or early-close day - no Nasdaq trade"); g_tradedKey = today; GVSet("tradedKey", today); return; }
+   if(Halted()) { LogEvent("SKIP", "halt switch on - no Nasdaq trade"); g_tradedKey = today; GVSet("tradedKey", today); return; }
+   if(InpSkipFomc && FomcDay(t1)) { LogEvent("SKIP", "Fed decision day - no Nasdaq trade"); g_tradedKey = today; GVSet("tradedKey", today); return; }
    int dir0; if(TagPositions("NQ ORB", dir0) + TagPositions("NQ SAR", dir0) > 0) return;
    double o = iOpen(_Symbol, PERIOD_M15, 1), c = iClose(_Symbol, PERIOD_M15, 1), hi = iHigh(_Symbol, PERIOD_M15, 1), lo = iLow(_Symbol, PERIOD_M15, 1);
-   if(c == o) return;
-   if(hi > lo && MathAbs(c - o) < InpMinBodyFrac * (hi - lo)) { LogEvent("SKIP", StringFormat("indecisive opening candle (body %.0f%% of its range) - no opening trade today", 100 * MathAbs(c - o) / (hi - lo))); return; }
-   if(!GoldBad()) { LogEvent("SKIP", "gold regime is GOOD (or gold EA silent) - no Nasdaq trade today"); return; }
+   if(c == o) { LogEvent("SKIP", "opening candle has no direction - no opening trade today"); g_tradedKey = today; GVSet("tradedKey", today); return; }
+   if(hi > lo && MathAbs(c - o) < InpMinBodyFrac * (hi - lo)) { LogEvent("SKIP", StringFormat("indecisive opening candle (body %.0f%% of its range) - no opening trade today", 100 * MathAbs(c - o) / (hi - lo))); g_tradedKey = today; GVSet("tradedKey", today); return; }
+   if(!GoldBad()) { LogEvent("SKIP", "gold regime is GOOD (or gold EA silent) - retrying during entry window"); return; }
    int dir = c > o ? 1 : -1;
    double atr = CashAtr();
    // remember the opening range for a possible reversal (kept across a restart)
    g_orDay = today; g_orDir = dir; g_orHi = hi; g_orLo = lo; g_orAtr = atr;
    GVSet("orDay", today); GVSet("orDir", dir); GVSet("orHi", hi); GVSet("orLo", lo); GVSet("orAtr", atr);
-   OpenTrade(dir, dir == 1 ? lo : hi, atr, 1.0, "NQ ORB");
+   g_lastEntryAttempt = TimeCurrent();
+   if(OpenTrade(dir, dir == 1 ? lo : hi, atr, 1.0, "NQ ORB"))
+   {
+      g_tradedKey = today;
+      GVSet("tradedKey", today);
+   }
 }
 
 // Stop-and-reverse once: the opening trade was stopped before InpReverseUntil (NY) -> the opening move failed;
@@ -584,7 +596,15 @@ void OnTradeTransaction(const MqlTradeTransaction &tr, const MqlTradeRequest &rq
 void OnTimer()
 {
    if(TerminalInfoInteger(TERMINAL_CONNECTED) && EnsureInitialBalance() && !g_announced) { g_announced = true; LogEvent("START", StringFormat("initial balance %.2f", g_initBal)); }
-   if(TerminalInfoInteger(TERMINAL_CONNECTED)) Guards();
+   if(TerminalInfoInteger(TERMINAL_CONNECTED))
+   {
+      Guards();
+      // Do not rely on a chart tick landing exactly at the M15 boundary.  The timer
+      // makes the 09:45-10:00 NY recovery window deterministic while TryEntry's
+      // date/position guards keep this idempotent with OnTick.
+      TryEntry();
+      TryReverse();
+   }
    if(IsTester()) return;
    int h = FileOpen("GoldBreakout\\nasdaq_heartbeat.txt", FILE_WRITE | FILE_TXT | FILE_COMMON | FILE_ANSI);
    if(h == INVALID_HANDLE) return;
@@ -600,7 +620,8 @@ void OnTick()
    Guards();
    datetime b = iTime(_Symbol, PERIOD_M15, 0);
    datetime b5 = iTime(_Symbol, PERIOD_M5, 0);
-   if(b != g_lastBar) { g_lastBar = b; TryEntry(); }
+   if(b != g_lastBar) g_lastBar = b;
+   TryEntry();
    TryReverse();
    if(b5 != g_lastBar5) { g_lastBar5 = b5; NoiseEngine(); }
 }

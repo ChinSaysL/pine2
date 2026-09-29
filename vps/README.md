@@ -126,6 +126,25 @@ The EA's built-in list covers 2026 US jobs, CPI and FOMC events. For later dates
 `/home/mt5/.wine/drive_c/users/mt5/AppData/Roaming/MetaQuotes/Terminal/Common/Files/GoldBreakout/news.txt`.
 The EA warns (Telegram) when every listed event is in the past.
 
+## Testing the EAs before going live
+
+`bash 09_test_ea_execution.sh` runs the deployed EAs + presets through the MT5 Strategy Tester in
+a **private copy of the Wine prefix** (`/home/mt5/.wine-test`), so the live terminal, its
+`Common\Files` (events.log, heartbeat, halt.flag, tester CSVs) and its global variables are never
+touched - verified with `md5sum -c` at the end of every run. The MT5 tester needs an account
+selected, so the rig terminal logs into the same demo account for a few minutes; the live session
+is not disturbed (checked in the live terminal journal).
+
+```bash
+bash 09_test_ea_execution.sh                        # 2026.05.01 .. today, model 1
+bash 09_test_ea_execution.sh 2026.08.01 2026.09.26 1
+bash 09_test_ea_execution.sh --cleanup              # drop an old rig first
+bash rig_cleanup.sh                                 # remove the rig (~3.5 GB), keep the results
+```
+Report: `/root/gtb_test_results/execution_test.log` plus one `tester_trades.csv` per EA
+(entry/exit in New York time, direction, lots, P/L, risk in USD and R, exit reason).
+The 2026-09-28 run is written up in `test_results/README.md`.
+
 ## Files in this folder
 
 | File | Purpose |
@@ -136,4 +155,7 @@ The EA warns (Telegram) when every listed event is in the past.
 | `04_upgrade_wine.sh` | WineHQ stable (MT5 refuses to support Wine 9) |
 | `05_restart_mt5.sh` | finish the Wine prefix update without Mono/Gecko, restart |
 | `06_deploy_ea.sh` | update the EA + `gtb-halt` / `gtb-resume` / `gtb-status` |
+| `09_test_ea_execution.sh` | run the deployed EAs through the MT5 tester in an isolated prefix copy |
+| `rig_cleanup.sh` | remove that test rig again (keeps `/root/gtb_test_results`) |
+| `test_results/` | the 2026-09-28 execution test: report + tester trade exports |
 | `run_mt5.sh`, `notifier.py`, `gtb_live.set`, `check_status.sh` | runtime files |
