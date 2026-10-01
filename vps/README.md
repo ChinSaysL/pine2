@@ -270,6 +270,35 @@ above the older channel low 4147.40, so no sell order would have been armed), bu
 `research/make_gtb_pen.py`, `research/run_cc_year.ps1`, `research/cc_compare2.py`,
 per-run exports `research/cc_y<year>_<variant>.csv`.
 
+## Gold: can the losses be limited? (entry/exit experiment, 2026-10-01)
+
+Full write-up: `research/gold_loss_experiments.txt`; tools `research/loss_anatomy.py`,
+`research/h1sim.py`, `research/gold_variants.py`, `research/gold_combo.py`, `research/gold_dd.py`,
+`research/gold_combo.py`, runners `research/run_cc_year.ps1` (variant inputs in one place).
+
+Where the losses are: 29% of trades are full -1R stops (the biggest loss bucket) and they are born
+fast - trades that die inside an hour win 1% of the time, trades held 12h+ win 68-74%. The profit is
+carried by 4% of trades (+3R or more) = 35% of all the wins.
+
+What was tested (H1 simulator for breadth, MT5 tester for the truth) and what happened:
+
+| idea | simulator | MT5 tester |
+|---|---|---|
+| fade the sweep (reverse after the stop) | -0.45 to -0.72R per event | - (decisively wrong) |
+| tighter stop (1.0-1.25 ATR) | +107R | **worse in chop** (-70.6R vs -40.4R in 2021), better only in trend years |
+| no breakeven after the add | +28R | no effect at all (3 years identical) |
+| continuation re-entry after a stop | +101R | no effect - the EA's normal logic already takes that trade |
+| second add at +2R/+3R | +63R | neutral (-1.9R / -1.1R / -0.1R) |
+| **split entry: half at the breakout, half after +0.5R** | _ | **the only variant that cuts the losses: worst year -42.6R -> -28.7R, bad years -33% to -47%, total -25%** |
+
+The split entry (half size at the level, the second half only once the break extends 0.5R) is the
+one change that limits the losses without giving up the edge: it halves what a failed breakout (the
+sweep) costs while a confirmed one still carries the full size. Implemented in the experiment EA as
+`InpEntryFrac=0.5` + `InpAddAtR=0.5`; see the results file for the per-year table. Two lessons for
+the harness: the H1 simulator can only *rank* ideas (two of its "wins" were refuted by the tester),
+and R-based accounting is scale-invariant, so a size change alone is invisible - only the geometry
+matters.
+
 ## Files in this folder
 
 | File | Purpose |

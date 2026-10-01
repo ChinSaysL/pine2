@@ -40,6 +40,13 @@ input double InpTrailAtr      = 3.0;     // Trailing stop (ATR)
 input double InpAddAtR        = 1.0;     // Add to winner at (R), 0 = off
 input double InpBufAtr        = 0.05;    // Breakout buffer (ATR)
 input double InpCloseMinAtr   = -1;      // Min close beyond the level to arm an order (ATR, -1 = off)
+input bool   InpBeAfterAdd    = true;    // Move both stops to the entry after the add
+input double InpEntryFrac    = 1.0;     // Share of the risk taken at the breakout
+input double InpAdd2AtR      = 0;       // Second add at this R (0 = off)
+input bool   InpReentryEnable = false;   // After a stop-out, go again in the same direction
+input double InpReentryStopAtr= 1.5;    // ... with this initial stop (ATR)
+input int    InpReentryBars   = 48;      // ... if the stop-out is not older than this many bars
+input int    InpReentryMax    = 1;       // ... at most this many re-entries per week of trading
 
 input group "RISK"
 input ENUM_RISK_MODE InpRiskMode = RISK_SCALED; // Risk mode
@@ -145,6 +152,12 @@ ulong    g_posIds[];
 double   g_posSL[];
 string   g_posWhy[];
 string   g_nextCloseReason = "";
+bool     g_added2 = false;       // the second add is filled
+bool     g_reArmed = false;      // a stop-out is waiting for its re-entry
+int      g_reDir = 0;            // direction of that re-entry
+double   g_rePrice = 0;          // price at which we were stopped out
+datetime g_reBar = 0;            // bar in which that happened
+int      g_reChain = 0;          // re-entries already taken after the last real entry
 
 //+------------------------------------------------------------------+
 // Saved state is per account, so moving from a trial to a new challenge starts clean.
@@ -739,7 +752,7 @@ void OnBarClose()
       g_entryBar = iTime(_Symbol, PERIOD_CURRENT, iBarShift(_Symbol, PERIOD_CURRENT, ft, false));
       GVSet("entry", g_entry); GVSet("stop0", g_stop0); GVSet("entryBar", (double)g_entryBar); GVSet("added", g_added);
    }
-   if(g_dir != 0 && n == 0) { g_dir = 0; g_added = false; }
+   if(g_dir != 0 && n == 0) { g_dir = 0; g_added = false; g_added2 = false; }
 
    string exitReason = limitHit ? "Loss limit" : g_passed ? "Target reached" : nearNews ? "News" : closingBar ? "Market close" : "";
    if(g_dir != 0 && exitReason != "") CloseAll(exitReason);
@@ -758,7 +771,7 @@ void OnBarClose()
             g_stop = g_dir == 1 ? MathMax(g_stop, trail) : MathMin(g_stop, trail);
          }
       }
-      if(g_added) g_stop = g_dir == 1 ? MathMax(g_stop, g_entry) : MathMin(g_stop, g_entry);
+      if(g_added && InpBeAfterAdd) g_stop = g_dir == 1 ? MathMax(g_stop, g_entry) : MathMin(g_stop, g_entry);
       SetStopAll(g_stop);
    }
 
@@ -767,14 +780,27 @@ void OnBarClose()
 
    // --- add to the winner --------------------------------------------------------------------------
    DeletePending("GTB Add");
+   if(g_dir != 0 && g_added && !g_added2 && InpAdd2AtR > 0 && n == 2)
+   {
+      double r02 = MathAbs(g_entry - g_stop0);
+      double addLvl2 = g_entry + g_dir * InpAdd2AtR * r02;
+      double addStop2 = InpBeAfterAdd ? (g_dir == 1 ? MathMax(g_stop, g_entry) : MathMin(g_stop, g_entry)) : g_stop;
+      double addDist2 = MathAbs(addLvl2 - addStop2);
+      double taken2; double lots2 = addDist2 > 0 ? LotsFor(riskNow, addDist2, taken2) : 0;
+      double others2 = OtherOpenRisk();
+      bool fits2 = !InpPropRules || (dayLoss + others2 + taken2 <= InpDailyLimitPct && totalLoss + others2 + taken2 <= InpTotalLimitPct);
+      if(lots2 > 0 && fits2 && !nearNews && !closingBar && !nextClosing && !limitHit && !g_passed)
+         if(SendStop(g_dir, addLvl2, addStop2, lots2, "GTB Add2", expiry, riskNow))
+            { g_added2 = true; LogEvent("ADD", StringFormat("second add at +%.1fR", InpAdd2AtR)); }
+   }
    if(g_dir != 0 && !g_added && InpAddAtR > 0 && n == 1)
    {
       double r0 = MathAbs(g_entry - g_stop0);
       double addLvl = g_entry + g_dir * InpAddAtR * r0;
-      double addStop = g_dir == 1 ? MathMax(g_stop, g_entry) : MathMin(g_stop, g_entry);
+      double addStop = InpBeAfterAdd ? (g_dir == 1 ? MathMax(g_stop, g_entry) : MathMin(g_stop, g_entry)) : g_stop;
       double addDist = MathAbs(addLvl - addStop);
       double taken;
-      double lots = addDist > 0 ? LotsFor(riskNow, addDist, taken) : 0;
+      double lots = addDist > 0 ? LotsFor(riskNow * InpEntryFrac, addDist, taken) : 0;
       double others = OtherOpenRisk();
       bool fits = !InpPropRules || (dayLoss + others + taken <= InpDailyLimitPct && totalLoss + others + taken <= InpTotalLimitPct);
       if(lots > 0 && fits && !nearNews && !closingBar && !nextClosing && !limitHit && !g_passed)
@@ -783,6 +809,22 @@ void OnBarClose()
 
    // --- entries, only while flat ----------------------------------------------------------------------
    DeletePending("GTB Buy");
+   if(InpReentryEnable && g_reArmed)
+   {
+      bool fresh = g_reBar > 0 && (iTime(_Symbol, PERIOD_CURRENT, 0) - g_reBar) <= (datetime)(InpReentryBars * per);
+      if(g_dir == 0 && g_reDir != 0 && fresh && !nearNews && !closingBar && !nextClosing && !limitHit && !g_passed)
+      {
+         double rdist = InpReentryStopAtr * atr;
+         double taken2; double rlots = LotsFor(riskNow, rdist, taken2);
+         if(rlots > 0)
+         {
+            if(SendStop(g_reDir, g_rePrice, g_rePrice - g_reDir * rdist, rlots, "GTB Re", expiry, riskNow))
+               { g_reChain++; g_reArmed = false; LogEvent("ENTRY", StringFormat("re-entry %s at %.2f after the stop-out", g_reDir == 1 ? "buy" : "sell", g_rePrice)); }
+         }
+      }
+      if(!fresh) { g_reArmed = false; g_reDir = 0; }
+   }
+   if(g_reArmed && g_dir != 0) { g_reArmed = false; g_reDir = 0; }
    DeletePending("GTB Sell");
    if(g_dir == 0)
    {
@@ -790,7 +832,7 @@ void OnBarClose()
       double longTrig = chanHigh + InpBufAtr * atr;
       double shortTrig = chanLow - InpBufAtr * atr;
       double taken;
-      double lots = LotsFor(riskNow, stopDist, taken);
+      double lots = LotsFor(riskNow * InpEntryFrac, stopDist, taken);
       double others = OtherOpenRisk();   // e.g. an open Nasdaq trade counts against the same guards
       bool riskFits = !InpPropRules || (dayLoss + others + taken <= InpDailyLimitPct && totalLoss + others + taken <= InpTotalLimitPct);
       bool started = !InpChallengeMode || bar1Close >= InpChallengeStart;
@@ -865,6 +907,7 @@ void OnTradeTransaction(const MqlTradeTransaction &tr, const MqlTradeRequest &rq
    ulong pos = HistoryDealGetInteger(tr.deal, DEAL_POSITION_ID);
    if(entry == DEAL_ENTRY_IN)
    {
+      if(StringFind(HistoryDealGetString(tr.deal, DEAL_COMMENT), "GTB Re") < 0) g_reChain = 0;
       int day = PragueDayKey((datetime)HistoryDealGetInteger(tr.deal, DEAL_TIME));
       if(day != g_lastTradeDay) { g_lastTradeDay = day; g_tradingDays++; GVSet("lastTradeDay", day); GVSet("tradingDays", g_tradingDays); }
       double sl = 0;
@@ -879,6 +922,14 @@ void OnTradeTransaction(const MqlTradeTransaction &tr, const MqlTradeRequest &rq
    else if(entry == DEAL_ENTRY_OUT)
    {
       long reason = HistoryDealGetInteger(tr.deal, DEAL_REASON);
+      // the position that just closed: an OUT deal of type BUY closes a short, and vice versa.
+      // (g_dir is only set at bar closes, so it is still 0 when a trade stops out inside its entry bar.)
+      int closedDir = HistoryDealGetInteger(tr.deal, DEAL_TYPE) == DEAL_TYPE_BUY ? -1 : 1;
+      if(InpReentryEnable && reason == DEAL_REASON_SL && g_reDir == 0)
+      {
+         g_reArmed = true; g_reDir = closedDir; g_rePrice = HistoryDealGetDouble(tr.deal, DEAL_PRICE);
+         g_reBar = (datetime)HistoryDealGetInteger(tr.deal, DEAL_TIME);
+      }
       string why = reason == DEAL_REASON_SL ? "Stop" : g_nextCloseReason != "" ? g_nextCloseReason : "Close";
       for(int i = 0; i < ArraySize(g_posIds); i++) if(g_posIds[i] == pos) g_posWhy[i] = why;
       double pnl = HistoryDealGetDouble(tr.deal, DEAL_PROFIT) + HistoryDealGetDouble(tr.deal, DEAL_COMMISSION) + HistoryDealGetDouble(tr.deal, DEAL_SWAP);

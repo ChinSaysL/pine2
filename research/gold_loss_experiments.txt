@@ -1,0 +1,113 @@
+GOLD - CAN THE LOSSES BE LIMITED (or turned into wins)?
+=======================================================
+2026-10-01, follow-up to the sweep question. Everything below is measured on the real engine,
+first on a validated H1 simulator (thousands of variants per minute), then on the MT5 Strategy
+Tester (tick-level, authoritative) for the survivors.
+
+1. WHERE THE LOSSES ACTUALLY ARE (2010-2026 export, 2,489 trades)
+---------------------------------------------------------------
+  full stop  -1R       723 trades (29%)   -722R      <- the single biggest loss bucket
+  -1R to -0.6R         227 ( 9%)          -178R
+  -0.6 to -0.3R        172 ( 7%)           -78R
+  -0.3R to 0           395 (16%)           -28R
+  wins > +3R           108 ( 4%)          +446R      <- 4% of the trades carry 35% of all profit
+
+  Time in trade:  <1h   189 trades, avg -0.95R, win rate  1%
+                  1-4h  522,        avg -0.57R, win rate 13%
+                  4-12h 1093,       avg  0.00R, win rate 38%
+                  12-24h 375,       avg +1.07R, win rate 68%
+                  >24h  310,        avg +1.11R, win rate 74%
+  Losses are born in the first hours; profit is made by trades that live a day or more.
+
+2. METHOD
+---------
+  research/h1sim.py      replays the real entries on H1 bars with the EA's rules (stop, add, trail,
+                         session flat). Validated against the export: +189R simulated vs +174R real
+                         trade-level total for 2020-2026 (+8.5%), per-trade median difference 0.000R
+                         (the earlier +116R gap was a fidelity bug: session exit one bar late, trail
+                         one bar early - both fixed).
+  run_cc_year.ps1        the deployed EA through the MT5 tester, one-year windows, fixed 1% risk,
+                         limits 50/50, a fresh magic per run.
+
+3. RESULTS - H1 SIMULATOR (2020-2026, 792 base entries, identical sample)
+------------------------------------------------------------------------
+  setup                              total R    PF   win%   avg R
+  live now (baseline)                 189.2    1.48   38    0.239
+  no breakeven after the add          217.4    1.53   40    0.274
+  stop 1.5 ATR (no BE)                263.3    1.47   36    0.332
+  stop 1.25 ATR (no BE)               313.5    1.49   33    0.396
+  stop 1.0 ATR (no BE)                392.5    1.52   29    0.496
+  adds at +1R and +2R (no BE)         252.1    1.58   37    0.318
+  time stop (out if < +0.3R after 6h) 177.1    1.52   39    0.224
+  FADE the failed breakout (reverse)  -42 to -134 depending on the second trade's stop
+  CONTINUATION re-entry after a stop  +247 to +291 (second trade +0.13 to +0.23R per event)
+
+  The two structural findings:
+   * after our stop is hit the price KEEPS GOING in the original direction: fading it loses
+     -0.45 to -0.72R per event (win rate 4-22%), while re-entering the same way earns
+     +0.13 to +0.23R per event (win rate 37-47%). "Turn the loss into a win" is possible, but the
+     trade to take is the continuation, not the reversal.
+   * the tight stop looked like the biggest single win in the simulator (+107R, +57%).
+
+4. RESULTS - MT5 TESTER (tick-level, one-year windows, same config)
+-------------------------------------------------------------------
+  year        live            stop 1.25 ATR     no BE after add
+  2021      -40.4R (128)      -70.6R (163)        -39.9R (128)
+  2022      -20.3R (212)      -27.4R (261)        -20.3R (212)  [identical]
+  2025      +81.9R (225)     +118.2R (273)        +81.9R (225)  [identical]
+  2026      +32.7R (118)      +51.4R (146)        +32.7R (118)  [identical]
+  total     +53.9R            +71.6R              +53.9R
+
+  * the tight stop is REFUTED as a loss-limiter: it is 75% worse in the worst chop year (2021),
+    a bit worse in 2022, and better only in the trending years - a variance amplifier, not a
+    loss reducer. The simulator's H1 path was too coarse to see the whipsaw (a 1.25-ATR stop is
+    about one H1 bar range, so intrabar sequencing decides everything).
+  * disabling the breakeven-after-add does nothing at all in the real engine (three years byte-
+    identical): the trailing stop is already at or above the entry by the time the add fills.
+  * the continuation re-entry DOES fire in the tester (17 events in 2022) but changes nothing:
+    after a stop-out the EA's normal logic already takes the next breakout, so my simulated
+    "extra leg" was a trade the engine already has (the simulator double counted real entries -
+    a reminder that the simulator can only rank ideas, never confirm them).
+
+5. THE SPLIT ENTRY - the one change that limits the losses without giving up the edge
+------------------------------------------------------------------------------------
+  Half the position at the breakout, the second half only once the break is confirmed by another
+  0.5R (1 ATR). A failed breakout (the sweep that started all of this) then costs HALF as much,
+  while a confirmed one carries the full size. Implemented as InpEntryFrac=0.5 with InpAddAtR=0.5
+  (each unit scales to the same % risk, so the geometry - not the size - is what changes).
+
+  MT5 tester, one-year windows (the split variant's R is converted to the same risk unit as the
+  baseline by multiplying by InpEntryFrac = 0.5, because each of its units risks half):
+
+    year    live                             split entry (normalised)
+    2021    -42.6R (131 trades)              -28.7R (165)     -33% loss
+    2022    -21.3R (214)                     -11.3R (277)     -47% loss
+    2023     +8.0R (155)                      +2.6R (193)     -68% profit
+    2024    +21.2R (163)                     +13.9R (204)     -34% profit
+    2025    +81.8R (224)                     +58.9R (273)     -28% profit
+    2026    +32.7R (119)                     +21.0R (148)     -36% profit
+    -------------------------------------------------------------------
+    total   +79.8R                           +56.4R           -29% total
+
+  Honest reading: this is a *de-risking dial*, not a new edge. Every window behaves proportionally
+  - the losing years improve by 33-47%, the winning years give up 28-36% - so the return per unit
+  of risk barely moves (total/worst-year: 1.87 -> 1.97). It does not turn the losses into wins and
+  it does not beat the current engine on total profit. What it does is take half the risk on every
+  *unconfirmed* breakout (the sweeps) while a confirmed one still gets the full size, which is the
+  only mechanism found in ~20 variants that touches the loss side at all.
+  Recommendation: worth having as an option (InpEntryFrac) rather than a default; if the daily
+  drawdown or the FTMO daily limit is the binding constraint (rather than the total return), moving
+  InpEntryFrac 1.0 -> 0.75 -> 0.5 is a controlled way to cut the bad days, and the size can be
+  dialled back up if the return matters more than the drawdown.
+
+6. VERDICT
+----------
+  * "Limit the losses" as a rule on the *exit* side does not work on this engine: every variant
+    tested here (tighter stop, breakeven toggles, time stops, fade-the-sweep, second add) either
+    changed nothing, made the bad years worse, or cut the tail that pays for the losses.
+  * The one mechanism that does work is on the *entry* side: pay for the trade in two halves, the
+    second only after the breakout proves itself. It halves the cost of the failed breakouts
+    (the exact trades this file started from) and keeps the confirmed ones intact.
+  * Recommended next step: run the split entry over 2023/2024/2026 too (running now) and, if it
+    holds, add InpEntryFrac to the deployed EA and slowly move the live preset (InpEntryFrac 1.0
+    -> 0.75 -> 0.5) while watching the fill quality of the second unit on the real account.

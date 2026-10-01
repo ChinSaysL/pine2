@@ -21,9 +21,21 @@ else { "COMPILE FAILED"; Get-Content "$expDir\compile.log" -ErrorAction Silently
 
 function Build([string]$pen, [int]$magic) {
     $lines = @(([IO.File]::ReadAllText("$r\live_inputs.txt") -replace "`r`n", "`n").Split("`n") | Where-Object { $_ -match '=' })
-    foreach ($pair in @("InpBadMode=1", "InpBadRiskMult=0.5", "InpCloseMinAtr=$pen",
-                        "InpRiskMode=0", "InpRiskPercent=1.0", "InpDailyLimitPct=50", "InpTotalLimitPct=50",
-                        "InpMagic=$magic")) {
+    $extra = @("InpBadMode=1", "InpBadRiskMult=0.5",
+               "InpRiskMode=0", "InpRiskPercent=1.0", "InpDailyLimitPct=50", "InpTotalLimitPct=50",
+               "InpMagic=$magic")
+    $map = @{ "off" = "InpCloseMinAtr=-1"; "p000" = "InpCloseMinAtr=0.0"; "p015" = "InpCloseMinAtr=0.15";
+              "p025" = "InpCloseMinAtr=0.25"; "p040" = "InpCloseMinAtr=0.40"; "p060" = "InpCloseMinAtr=0.60";
+              "s10" = "InpStopAtr=1.0"; "s125" = "InpStopAtr=1.25"; "s15" = "InpStopAtr=1.5"; "s30" = "InpStopAtr=3.0";
+              "t4" = "InpTrailAtr=4.0"; "t5" = "InpTrailAtr=5.0"; "a15" = "InpAddAtR=1.5"; "a0" = "InpAddAtR=0";
+              "nobe" = "InpBeAfterAdd=false"; "re15" = "InpReentryEnable=true";
+              "re" = "InpReentryEnable=true"; "r10" = "InpReentryStopAtr=1.0"; "r20" = "InpReentryStopAtr=2.0";
+              "add2" = "InpAdd2AtR=2.0"; "add25" = "InpAdd2AtR=2.5"; "add3" = "InpAdd2AtR=3.0";
+              "frac" = "InpEntryFrac=0.5"; "frac05" = "InpAddAtR=0.5" }
+    foreach ($part in $pen.Split("+")) {
+        if ($map.ContainsKey($part)) { $extra += $map[$part] } else { $extra += "InpCloseMinAtr=-1" }
+    }
+    foreach ($pair in $extra) {
         $k = $pair.Split("=")[0]
         $lines = @($lines | Where-Object { $_.Split("=")[0] -ne $k })
         $lines += $pair
@@ -34,7 +46,7 @@ $magicBase = 24241000
 $mi = 0
 foreach ($y in $Windows.Split(",")) {
     foreach ($p in $Pens.Split(",")) {
-        $pen = switch ($p) { "off" { "-1" } "p000" { "0.0" } "p015" { "0.15" } "p025" { "0.25" } "p040" { "0.40" } "p060" { "0.60" } }
+        $pen = $p
         $name = "y$y`_$p"
         $magic = $magicBase + $mi; $mi++
         Get-Process terminal64 -ErrorAction SilentlyContinue | Stop-Process -Force
