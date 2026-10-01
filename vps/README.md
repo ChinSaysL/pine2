@@ -65,11 +65,19 @@ TELEGRAM_CHAT_ID=123456789
 ```
 then `systemctl restart gtb-notifier`.
 
+Every `START` / `RESTORE` message carries a live account snapshot (`balance / equity / today % /
+total % / open / limit stop`) so that the `initial balance` in the EA's own line cannot be read as a
+state reset: it is the account's **starting** balance, the reference the loss guards are measured
+from (see the guards section). A deliberate `systemctl restart` briefly produces "MT5 service is not
+running" followed by "... is running again" - that is the watchdog reacting to the restart.
+
 ## Regime filter
 
 The EA runs every signal on paper as well (all sessions, no risk limits). When those paper trades
-lost money over the last 60 days (`InpRegimeDays`), it is in a **bad regime** and only takes new
-entries during the New York session (08:00-17:00 New York); otherwise it trades every session.
+lost money over the last 60 days (`InpRegimeDays`), it is in a **bad regime**: the live setting
+(`InpBadMode=1`, `InpBadRiskMult=0.5`) keeps trading all sessions at **half risk**. `InpBadMode=0`
+is the older variant that only takes New York-session entries (08:00-17:00 New York, `InpNYStartHour`
+/ `InpNYEndHour`) - kept in the EA but not used live. `InpRegimeFilter=false` switches the filter off.
 Telegram announces each switch (`REGIME ...`), and `gtb-status` shows `regime=`, `regime_paper_r=`
 and `history_ready=`. On a fresh MT5 the EA first downloads enough history (daily bars for the
 200-day EMA, hourly bars for the replay); if that is still missing after 10 minutes you get a warning.
@@ -221,6 +229,9 @@ trade is still taken). Test profile: fixed 1% risk, limits 50%/50%, fresh magic 
 * A **fresh test started at the initial balance trips the 2.5%/5% FTMO guards** in the first
   months and then stops for good (`g_limitStop` is persisted in a global variable), which
   truncates the run. Hence the fixed-1%/50%-50% research profile and one fresh magic per run.
+  (Note: these runs use `research/live_inputs.txt`, which still has challenge mode **off** and news
+  75/15 min, while the deployed `vps/gtb_live.set` has challenge mode **on** and news 30/30. All
+  variants shared the same profile, so the comparison holds; absolute numbers differ slightly.)
 * **Long tester runs go silent**: the deployed EA keeps trading normally, then stops opening
   positions after ~2.5-4 simulated years with no error in the journal (verified against MT5's own
   report, not just the EA's CSV export). It is a tester-side effect (the exports before that point

@@ -160,7 +160,18 @@ def main():
                         icon = {"ENTRY": "📈", "ADD": "➕", "CLOSE": "📉", "EXIT": "🚪", "ERROR": "❌", "WARNING": "⚠️",
                                 "STOP": "⛔", "TARGET": "🏁", "START": "▶️", "RESTORE": "🔄",
                                 "FILL": "✅", "SKIP": "⏭️", "REGIME": "🧭"}.get(kind, "ℹ️")
-                        send(f"{icon} {kind} {sym}: {msg}")
+                        text = f"{icon} {kind} {sym}: {msg}"
+                        if kind in ("START", "RESTORE"):
+                            # The START line quotes the account's STARTING balance - the reference the
+                            # FTMO guards are measured from, not "this is what the account holds now".
+                            # Append the live account state so it cannot be read as a state reset.
+                            h = read_heartbeat()
+                            if h:
+                                text += (f"\n   account now: balance {h.get('balance')}  equity {h.get('equity')}"
+                                         f"  today {h.get('day_pl_pct')}%  total {h.get('total_pl_pct')}%"
+                                         f"  open {h.get('positions')}"
+                                         f"  limit stop {'YES' if h.get('limit_stop') == '1' else 'no'}")
+                        send(text)
         except FileNotFoundError:
             pass
 
