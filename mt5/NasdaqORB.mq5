@@ -44,6 +44,16 @@ input double InpDailyLimitPct  = 3.5;   // Internal daily guard (FTMO: 5%)
 input double InpTotalLimitPct  = 7.0;   // Internal total guard (FTMO: 10%)
 input double InpProfitTarget   = 10;    // Stop opening trades once the account is up this much (0 = off)
 
+input group "EXIT MANAGEMENT (afternoon break-even, 2026-09-30 research)"
+// Afternoon break-even: from InpBeAfterHour New York time on, any of our positions still in profit by at
+// least InpBeAfterMinR gets its stop moved to the entry (+ a small buffer for costs). Tested on FTMO
+// US100.cash M5 2021-09..2026-09 over both engines: total +147.4R vs +136.3R with the plain session exit,
+// PF 1.15 -> 1.18, positive in 5 of 6 years; it touches ~11% of the opening-range trades (80 better,
+// 56 worse). InpBeAfterHour = 0 switches it off (exactly the old behaviour).
+input int    InpBeAfterHour  = 13;    // NY hour from which a trade in profit gets a break-even stop (0 = off)
+input double InpBeAfterMinR  = 0.5;   // ...profit needed for that, in R
+input double InpBeBufferR    = 0.015; // break-even buffer as a fraction of R (covers spread/commission)
+
 input group "CLOCK / EXECUTION"
 input int    InpServerMinusNY     = 7;
 input int    InpServerMinusPrague = 1;
@@ -343,6 +353,41 @@ void Guards()
    if(m >= InpExitHour * 60 + InpExitMinute || m < 9 * 60) CloseMine("Session exit");
 }
 
+// Afternoon break-even for our open positions (see the EXIT MANAGEMENT inputs). Called on every tick and
+// from the timer, so it also works on quiet afternoons. Idempotent: once the stop is at/above the entry it
+// does nothing. Never touched by the tester comparison - it runs there too, so the tester shows its effect.
+void BeAfterHours()
+{
+   if(InpBeAfterHour <= 0) return;
+   if(NYMinutes(TimeCurrent()) < InpBeAfterHour * 60) return;
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID), ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   if(bid <= 0 || ask <= 0) return;
+   long   lvl = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong tk = PositionGetTicket(i);
+      if(tk == 0 || PositionGetString(POSITION_SYMBOL) != _Symbol || PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+      int    dir = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ? 1 : -1;
+      double open = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl   = PositionGetDouble(POSITION_SL);
+      if(sl <= 0) continue;                        // no stop on the position -> nothing to protect
+      double R    = (open - sl) * dir;             // the trade's original risk, in price terms
+      if(R <= 0) continue;
+      double px   = dir == 1 ? bid : ask;
+      double gainR = (px - open) * dir / R;
+      if(gainR < InpBeAfterMinR) continue;         // not enough profit yet -> leave it alone
+      double buf  = MathMax(InpBeBufferR * R, ask - bid);
+      double be   = NormalizeDouble(open + dir * buf, _Digits);
+      if((be - sl) * dir <= 0) continue;           // the stop is already at/above break-even
+      if((px - be) * dir < lvl * _Point) continue; // would sit inside the broker's minimum distance
+      double tp = PositionGetDouble(POSITION_TP);
+      if(trade.PositionModify(tk, be, tp))
+         LogEvent("BE", StringFormat("afternoon break-even: stop %.2f -> %.2f (+%.2fR in profit)", sl, be, gainR));
+      else
+         LogEvent("WARNING", StringFormat("break-even modify %I64u failed: %d %s", tk, trade.ResultRetcode(), trade.ResultRetcodeDescription()));
+   }
+}
+
 // This EA's positions whose comment contains tag.
 int TagPositions(const string tag, int &dir)
 {
@@ -528,8 +573,9 @@ int OnInit()
    g_orDay = (int)GVGet("orDay", 0); g_orDir = (int)GVGet("orDir", 0); g_revDay = (int)GVGet("revDay", 0);
    g_orHi = GVGet("orHi", 0); g_orLo = GVGet("orLo", 0); g_orAtr = GVGet("orAtr", 0);
    if(!IsTester()) EventSetTimer(30);
-   LogEvent("START", StringFormat("%s Nasdaq ORB, gate %s, risk %.2fx of max %.2f%%, guards %.1f%%/%.1f%%, FOMC days %s, reverse once %s, noise engine %s", _Symbol,
-            InpGate == GATE_GOLD_BAD ? "gold BAD only" : "always", InpRiskMult, InpMaxRiskPct, InpDailyLimitPct, InpTotalLimitPct, InpSkipFomc ? "skipped" : "traded", InpReverseOnce ? StringFormat("before %d:00 NY", InpReverseUntil) : "off", InpNoiseEngine ? StringFormat("on (%.2fx)", InpNoiseRiskMult) : "off"));
+   LogEvent("START", StringFormat("%s Nasdaq ORB, gate %s, risk %.2fx of max %.2f%%, guards %.1f%%/%.1f%%, FOMC days %s, reverse once %s, noise engine %s, break-even %s", _Symbol,
+            InpGate == GATE_GOLD_BAD ? "gold BAD only" : "always", InpRiskMult, InpMaxRiskPct, InpDailyLimitPct, InpTotalLimitPct, InpSkipFomc ? "skipped" : "traded", InpReverseOnce ? StringFormat("before %d:00 NY", InpReverseUntil) : "off", InpNoiseEngine ? StringFormat("on (%.2fx)", InpNoiseRiskMult) : "off",
+            InpBeAfterHour > 0 ? StringFormat("from %d:00 NY if >= +%.2fR", InpBeAfterHour, InpBeAfterMinR) : "off"));
    return INIT_SUCCEEDED;
 }
 
@@ -599,6 +645,8 @@ void OnTimer()
    if(TerminalInfoInteger(TERMINAL_CONNECTED))
    {
       Guards();
+      BeAfterHours();
+
       // Do not rely on a chart tick landing exactly at the M15 boundary.  The timer
       // makes the 09:45-10:00 NY recovery window deterministic while TryEntry's
       // date/position guards keep this idempotent with OnTick.
@@ -618,6 +666,8 @@ void OnTick()
 {
    if(!EnsureInitialBalance()) return;
    Guards();
+   BeAfterHours();
+
    datetime b = iTime(_Symbol, PERIOD_M15, 0);
    datetime b5 = iTime(_Symbol, PERIOD_M5, 0);
    if(b != g_lastBar) g_lastBar = b;

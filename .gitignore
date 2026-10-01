@@ -5,6 +5,7 @@ research/*.csv
 research/tester_*.ini
 research/mq_symbols.txt
 research/brainstorm_out.txt
+research/*.log
 __pycache__/
 *.pyc
 # MetaEditor compile logs

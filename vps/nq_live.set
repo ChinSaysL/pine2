@@ -14,6 +14,13 @@ InpReverseUntil=12
 InpNoiseEngine=true
 InpNoiseRiskMult=0.75
 InpNoiseDays=14
+; Afternoon break-even (research 2026-09-30, FTMO US100.cash M5 2021-09..2026-09: +147.4R vs +136.3R with the
+; plain session exit, PF 1.15 -> 1.18): from 13:00 New York time, any position in profit by at least +0.5R
+; gets its stop moved to the entry (+ a 0.015R buffer for costs). It touches ~11% of trades (80 better /
+; 56 worse) and is what stops the "up 1R in the morning, negative at 15:55" give-backs. 0 = off (old behaviour).
+InpBeAfterHour=13
+InpBeAfterMinR=0.5
+InpBeBufferR=0.015
 InpMaxRiskPct=1.25
 InpRiskDivisor=4
 InpMinRiskPct=0.25

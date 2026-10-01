@@ -1,0 +1,70 @@
+GOLD - MINIMUM CLOSE PENETRATION RULE - experiment, 2026-10-01
+==============================================================
+
+Question: the 2026-10-01 gold trade (live events.log) entered on a textbook liquidity sweep
+(20:16 New York, the 24h low 4147.40 was pierced to 4139.11, i.e. 0.63 x ATR below the level, and
+the bar closed back at 4145.09; the trade never got past +0.29R and was stopped for -1R / -$53).
+Could a rule that requires the breaking bar to CLOSE beyond the level have avoided it, and would
+that have been worth it?
+
+Implementation (variant EA, the deployed EA is untouched)
+--------------------------------------------------------
+research/ea/GTBClosePen.mq5  - generated from mt5/GoldTrendBreakout.mq5 by research/make_gtb_pen.py
+                               (20 changed lines)
+
+  InpCloseMinAtr   -1 = off = byte-identical live behaviour
+                   >= 0: a breakout order for a side may only be armed if the bar that just
+                   closed ended at least InpCloseMinAtr x ATR beyond the channel edge as it
+                   stood BEFORE that bar (channel excluding the closed bar), in both the live
+                   path (OnBarClose) and the paper/regime engine (PaperStep).
+
+  The first, natural version (compare the close against the channel that INCLUDES the closed bar)
+  is degenerate: that bar's own extreme is the channel edge, so its close can never be beyond it -
+  it switched the strategy off (2021: 128 trades -> 2). The working form excludes the bar.
+
+Result - one-year windows, local Strategy Tester, XAUUSD H1, fixed 1% risk, limits 50/50,
+fresh magic per run (the deployed EA vs the same EA with the gate):
+
+  year           live (off)          gate >= +0.15 ATR    gate >= +0.25 ATR
+  2021           -40.4R (128)        -17.6R ( 43)         -16.8R ( 40)
+  2022           -21.1R (212)         +3.2R ( 73)         +11.3R ( 66)
+  2023            +7.8R (151)         +1.3R ( 70)          +3.4R ( 64)
+  2024           +20.2R (159)         +3.0R ( 77)          +2.3R ( 71)
+  2025           +81.4R (224)        +40.6R (142)         +36.6R (131)
+  2026 (to 09-18) +34.5R (117)        +9.3R ( 63)          +7.9R ( 54)
+  ----------------------------------------------------------------------------
+  total          +82.6R (991)        +39.8R (468)         +44.8R (426)
+                 PF 1.21 0.083R/tr   PF 1.23 0.085R/tr    PF 1.27 0.105R/tr
+
+  A plain "close beyond the level" gate (X = 0) is even more extreme (2021: 53 trades).
+
+Reading: the gate removes about half the trades and about half the profit; profit factor and R per
+trade barely move. It is the same strategy executed half as often, not a better strategy - it saves
+money in the two losing years and gives back far more in the four winning ones (2025 alone: -41R).
+Today's trade would have been skipped (at 20:00 New York the previous bar closed at 4152.60, above
+the older channel low 4147.40, so no sell order would have been armed), but that skip is worth ~1R
+against ~40R of six-year profit.
+
+VERDICT: keep the gold entry logic as is. Third filter tested that avoids the sweep at a multiple
+of what the sweep costs (Asian-session skip -91R over 16 years, daily ADX >= 20 -14R,
+close-penetration -42R over 6 years).
+
+Reproduce
+---------
+  python research/make_gtb_pen.py                 # writes research/ea/GTBClosePen.mq5
+  powershell -File research/run_cc_year.ps1       # 6 windows x 5 variants, ~30s each
+  python research/cc_compare2.py                  # pooled + per-year table
+  # exports land in research/cc_y<year>_<variant>.csv (git-ignored, like the other research CSVs)
+
+Harness notes found while running this
+--------------------------------------
+* A fresh test started at the initial balance trips the EA's 2.5%/5% FTMO guards and then stops for
+  good (g_limitStop is persisted in a terminal global variable and is loaded again at init), which
+  truncates the backtest. Use fixed 1% risk, limits 50/50 and a fresh magic per run.
+* Long tester runs of the deployed EA go silent after ~2.5-4 simulated years: it trades normally and
+  then stops opening positions with no error (confirmed against MT5's own report, not just the EA's
+  CSV export). TrendDir() returning 0 when the daily series/EMA buffer cannot be read silently
+  blocks every entry - worth a notifier alert for "gold EA took no trade for N days".
+* MT5 with /config: Start-Process -Wait returns before the tester finishes when another terminal
+  instance is already running, so the export is copied mid-run. The runners now wait for the process
+  to disappear and print the exported first/last trade date as a coverage check.
