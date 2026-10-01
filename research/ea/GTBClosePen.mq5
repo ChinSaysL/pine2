@@ -1,0 +1,1068 @@
+//+------------------------------------------------------------------+
+//| Gold Trend Breakout [FTMO] - MT5 Expert Advisor                  |
+//|                                                                  |
+//| Port of gold_trend_breakout_ftmo.pine. Attach to XAUUSD H1.      |
+//|   1. Daily trend: yesterday's daily close vs its 50-day average; |
+//|      longs above, shorts below, nothing within the neutral band, |
+//|      and only on the trend's side of the 200-day EMA.            |
+//|   2. Entry: stop order at the break of the last 24 hours'        |
+//|      high / low (+ a small buffer).                              |
+//|   3. Initial stop 2 ATR; then trails 3 ATR behind the best price.|
+//|   4. At +1R a second position is added and the stop of both     |
+//|      moves to at least the first entry (breakeven).              |
+//|   5. Flat before gold's 17:00 New York daily / weekend close and |
+//|      around listed high-impact news.                             |
+//|   6. FTMO guards: daily and total loss limits measured from the  |
+//|      initial balance (day = midnight Prague), a trade is only    |
+//|      opened if every open trade could hit its stop without       |
+//|      passing a limit; optional challenge mode stops at target.   |
+//+------------------------------------------------------------------+
+#property copyright "Gold Trend Breakout - close-penetration experiment"
+#property version   "1.00"
+#property strict
+
+#include <Trade\Trade.mqh>
+
+enum ENUM_RISK_MODE { RISK_FIXED = 0, RISK_SCALED = 1 };
+enum ENUM_BAD_MODE { BAD_NY_ONLY = 0, BAD_REDUCED_RISK = 1 };
+
+input group "SIGNAL"
+input double InpChanHours     = 24;      // Breakout channel (hours)
+input bool   InpUseTrend      = true;    // Trade only with the daily trend
+input int    InpTrendDays     = 50;      // Daily trend average (days)
+input double InpNeutralBand   = 1.0;     // Neutral band (% from the daily average)
+input double InpAdxMin        = 0;       // Daily ADX(14, Wilder) minimum, 0 = off
+input double InpEmaSepPct     = 0;       // Min % separation from the daily EMA on the trend side (0 = just the right side), -1 = off
+input int    InpEmaLen        = 200;     // Daily EMA length for the separation filter
+input int    InpAtrLen        = 14;      // ATR length (TradingView-style RMA)
+input double InpStopAtr       = 2.0;     // Initial stop (ATR)
+input double InpTrailAtr      = 3.0;     // Trailing stop (ATR)
+input double InpAddAtR        = 1.0;     // Add to winner at (R), 0 = off
+input double InpBufAtr        = 0.05;    // Breakout buffer (ATR)
+input double InpCloseMinAtr   = -1;      // Min close beyond the level to arm an order (ATR, -1 = off)
+input bool   InpBeAfterAdd    = true;    // Move both stops to the entry after the add
+input double InpEntryFrac    = 1.0;     // Share of the risk taken at the breakout
+input double InpAdd2AtR      = 0;       // Second add at this R (0 = off)
+input bool   InpReentryEnable = false;   // After a stop-out, go again in the same direction
+input double InpReentryStopAtr= 1.5;    // ... with this initial stop (ATR)
+input int    InpReentryBars   = 48;      // ... if the stop-out is not older than this many bars
+input int    InpReentryMax    = 1;       // ... at most this many re-entries per week of trading
+
+input group "RISK"
+input ENUM_RISK_MODE InpRiskMode = RISK_SCALED; // Risk mode
+input double InpRiskPercent   = 1.0;     // Fixed: risk per trade (% of initial balance)
+input double InpMaxRiskPct    = 1.25;    // Scaled: max risk (%)
+input double InpRiskDivisor   = 4;       // Scaled: losses to limit
+input double InpMinRiskPct    = 0.25;    // Scaled: min risk (%)
+
+input group "PROP FIRM RULES (FTMO)"
+input double   InpInitialBalance = 0;    // Initial balance of the account (0 = balance when first attached)
+input bool     InpPropRules      = true; // Enforce loss limits
+input double   InpDailyLimitPct  = 2.5;  // Daily loss limit (% of initial balance, day = midnight Prague)
+input double   InpTotalLimitPct  = 5.0;  // Max loss limit (% of initial balance)
+input bool     InpChallengeMode  = false;// Challenge mode: stop once the target is reached
+input double   InpProfitTarget   = 10;   // Profit target (%)
+input int      InpMinTradingDays = 4;    // Min trading days
+input double   InpPostTargetRisk = 0.1;  // Risk after target, until min days are met (%)
+input datetime InpChallengeStart = D'2020.01.01'; // Challenge start (server time)
+input bool     InpFlatBeforeClose = true;// Flat before the daily and weekend close
+input int      InpFlatMinutes    = 10;   // Close this many minutes before 17:00 New York
+input bool     InpNewsFilter     = true; // Flat around high-impact news
+input int      InpNewsBeforeMin  = 75;   // Flat minutes before news
+input int      InpNewsAfterMin   = 15;   // No entries minutes after news
+
+input group "REGIME FILTER"
+input bool   InpRegimeFilter    = true;  // Change behaviour while the regime is bad
+input ENUM_BAD_MODE InpBadMode  = BAD_REDUCED_RISK; // Bad regime: all sessions at reduced risk, or New York only
+input double InpBadRiskMult     = 0.5;   // Bad regime risk multiplier (reduced-risk mode)
+input int    InpRegimeDays      = 60;    // Bad regime = paper results of the last N days negative
+input int    InpRegimeMinTrades = 5;     // ...with at least this many paper trades in the window
+input int    InpNYStartHour     = 8;     // New York session start (NY hour)
+input int    InpNYEndHour       = 17;    // New York session end (NY hour)
+input double InpPaperCost       = 0.30;  // Paper trades: spread + commission per unit of price (round trip)
+
+input group "SERVER CLOCK"
+input int    InpServerMinusNY     = 7;   // Server clock minus New York clock (hours)
+input int    InpServerMinusPrague = 1;   // Server clock minus Prague clock (hours)
+
+input group "EXECUTION"
+input long   InpMagic          = 24240001; // Magic number
+input int    InpDeviationPts   = 50;       // Max slippage for market orders (points)
+input bool   InpEventLog       = true;     // Write events to Common\Files\GoldBreakout\events.log
+
+// High-impact US events, New York time. Overridden by Common\Files\GoldBreakout\news.txt when present
+// (one "YYYY-MM-DD HH:MM" per line). Keep it updated: when every event is in the past, the filter is idle.
+string DEFAULT_NEWS[] = {
+   "2026-01-09 08:30","2026-01-13 08:30","2026-02-11 08:30","2026-02-13 08:30","2026-03-06 08:30",
+   "2026-03-11 08:30","2026-04-03 08:30","2026-04-10 08:30","2026-05-08 08:30","2026-05-12 08:30",
+   "2026-06-05 08:30","2026-06-10 08:30","2026-07-02 08:30","2026-07-14 08:30","2026-08-07 08:30",
+   "2026-08-12 08:30","2026-09-04 08:30","2026-09-11 08:30","2026-10-02 08:30","2026-10-14 08:30",
+   "2026-11-06 08:30","2026-11-10 08:30","2026-12-04 08:30","2026-12-10 08:30","2026-01-28 14:00",
+   "2026-02-18 14:00","2026-03-18 14:00","2026-04-08 14:00","2026-04-29 14:00","2026-05-20 14:00",
+   "2026-06-17 14:00","2026-07-08 14:00","2026-07-29 14:00","2026-08-19 14:00","2026-09-16 14:00",
+   "2026-10-28 14:00","2026-12-09 14:00",
+   // US holidays / early closes: gold halts early (around 13:30 NY), before the normal 16:50 flat time,
+   // so a position would otherwise be carried into the next session. Listed as events -> flat 75 min before.
+   "2026-11-26 13:30","2026-11-27 13:30","2026-12-24 13:30","2026-12-31 13:30",
+   "2027-01-18 13:30","2027-02-15 13:30","2027-05-31 13:30","2027-06-18 13:30","2027-07-05 13:30",
+   "2027-09-06 13:30"};
+
+CTrade   trade;
+int      g_adxH = INVALID_HANDLE;  // daily ADX (regime filter, optional)
+int      g_emaH = INVALID_HANDLE;  // daily EMA (regime filter, optional)
+datetime g_newsServer[];           // news events in server time
+datetime g_lastBar = 0;
+double   g_initBal = 0;
+
+// trade state (mirrors the Pine script)
+int      g_dir = 0;                // +1 long, -1 short, 0 flat
+datetime g_entryBar = 0;           // open time of the bar in which the first position filled
+double   g_entry = 0;              // first position's entry price
+double   g_stop0 = 0;              // initial stop
+double   g_stop = 0;               // current stop of the whole trade
+bool     g_added = false;
+
+// challenge / limit state (persisted in terminal global variables)
+int      g_dayKey = 0;
+double   g_dayStart = 0;
+int      g_tradingDays = 0;
+int      g_lastTradeDay = 0;
+bool     g_passed = false;
+bool     g_limitStop = false;       // total limit reached: trading stopped for good
+
+// paper-trading engine: every signal, all sessions, no guards - measures whether the strategy is working
+struct PaperUnit { double entry; double risk; datetime opened; };
+int       sh_dir = 0;
+double    sh_stop = 0, sh_entry0 = 0, sh_risk0 = 0;
+datetime  sh_entryBar = 0, sh_lastBar = 0;
+PaperUnit sh_units[];
+int       sh_ordDir[2];
+double    sh_ordTrig[2], sh_ordStop[2];
+int       sh_nOrd = 0;
+datetime  sh_closedAt[];            // paper units closed: time, R, open time
+double    sh_closedR[];
+datetime  sh_openedAt[];
+bool      g_badRegime = false;
+string BadModeText() { return InpBadMode == BAD_NY_ONLY ? "only New York-session entries" : StringFormat("all sessions at %.0f%% risk", InpBadRiskMult * 100); }
+double    g_regimeR = 0;
+int       g_regimeN = 0;
+
+// tester export: initial stop and exit reason per position id
+ulong    g_posIds[];
+double   g_posSL[];
+string   g_posWhy[];
+string   g_nextCloseReason = "";
+bool     g_added2 = false;       // the second add is filled
+bool     g_reArmed = false;      // a stop-out is waiting for its re-entry
+int      g_reDir = 0;            // direction of that re-entry
+double   g_rePrice = 0;          // price at which we were stopped out
+datetime g_reBar = 0;            // bar in which that happened
+int      g_reChain = 0;          // re-entries already taken after the last real entry
+
+//+------------------------------------------------------------------+
+// Saved state is per account, so moving from a trial to a new challenge starts clean.
+string GV(const string k) { return StringFormat("GTB_%I64d_%I64d_%s", InpMagic, AccountInfoInteger(ACCOUNT_LOGIN), k); }
+double GVGet(const string k, double def) { return GlobalVariableCheck(GV(k)) ? GlobalVariableGet(GV(k)) : def; }
+// written to disk straight away: MT5 otherwise saves global variables only on a clean shutdown, and a service
+// restart could lose the trading-day count, the day-start balance or the initial balance
+void   GVSet(const string k, double v) { GlobalVariableSet(GV(k), v); GlobalVariablesFlush(); }
+
+datetime ToNY(datetime server)     { return server - InpServerMinusNY * 3600; }
+datetime ToPrague(datetime server) { return server - InpServerMinusPrague * 3600; }
+int NYMinutes(datetime server) { MqlDateTime d; TimeToStruct(ToNY(server), d); return d.hour * 60 + d.min; }
+int NYWeekday(datetime server) { MqlDateTime d; TimeToStruct(ToNY(server), d); return d.day_of_week; }
+int PragueDayKey(datetime server) { MqlDateTime d; TimeToStruct(ToPrague(server), d); return d.year * 10000 + d.mon * 100 + d.day; }
+bool IsTester() { return (bool)MQLInfoInteger(MQL_TESTER); }
+
+//+------------------------------------------------------------------+
+void LogEvent(const string kind, const string msg)
+{
+   PrintFormat("[%s] %s", kind, msg);
+   if(!InpEventLog || IsTester()) return;
+   int h = FileOpen("GoldBreakout\\events.log", FILE_READ | FILE_WRITE | FILE_TXT | FILE_COMMON | FILE_SHARE_READ | FILE_ANSI);
+   if(h == INVALID_HANDLE) return;
+   FileSeek(h, 0, SEEK_END);
+   FileWriteString(h, StringFormat("%s|%s|%s|%s\n", TimeToString(TimeGMT(), TIME_DATE | TIME_SECONDS), kind, _Symbol, msg));
+   FileClose(h);
+}
+
+//+------------------------------------------------------------------+
+datetime ParseNY(const string s)
+{
+   // "YYYY-MM-DD HH:MM" in New York time -> server time
+   string t = s;
+   StringTrimLeft(t); StringTrimRight(t);
+   if(StringLen(t) < 16) return 0;
+   StringReplace(t, "-", ".");
+   datetime ny = StringToTime(t);
+   return ny == 0 ? 0 : ny + InpServerMinusNY * 3600;
+}
+
+void LoadNews()
+{
+   ArrayResize(g_newsServer, 0);
+   string lines[];
+   int n = 0;
+   int h = FileOpen("GoldBreakout\\news.txt", FILE_READ | FILE_TXT | FILE_COMMON | FILE_ANSI);
+   if(h != INVALID_HANDLE)
+   {
+      while(!FileIsEnding(h)) { string ln = FileReadString(h); if(StringLen(ln) >= 16) { ArrayResize(lines, n + 1); lines[n++] = ln; } }
+      FileClose(h);
+   }
+   if(n == 0) { n = ArraySize(DEFAULT_NEWS); ArrayResize(lines, n); for(int i = 0; i < n; i++) lines[i] = DEFAULT_NEWS[i]; }
+   for(int i = 0; i < n; i++)
+   {
+      datetime t = ParseNY(lines[i]);
+      if(t > 0) { int k = ArraySize(g_newsServer); ArrayResize(g_newsServer, k + 1); g_newsServer[k] = t; }
+   }
+}
+
+// Inside the news window around time t: [event - before, event + after].
+bool NearNews(datetime t)
+{
+   if(!InpNewsFilter) return false;
+   for(int i = 0; i < ArraySize(g_newsServer); i++)
+      if(g_newsServer[i] - t <= InpNewsBeforeMin * 60 && t - g_newsServer[i] <= InpNewsAfterMin * 60) return true;
+   return false;
+}
+
+//+------------------------------------------------------------------+
+// Pine ta.atr(): RMA of the true range, seeded with the simple average of the first len values.
+double AtrRma(int shift)
+{
+   MqlRates r[];
+   ArraySetAsSeries(r, true);
+   int n = CopyRates(_Symbol, PERIOD_CURRENT, shift, 500, r);
+   if(n < InpAtrLen + 2) return 0;
+   double atr = 0, sum = 0;
+   int count = 0;
+   for(int i = n - 2; i >= 0; i--)
+   {
+      double tr = MathMax(r[i].high - r[i].low, MathMax(MathAbs(r[i].high - r[i + 1].close), MathAbs(r[i].low - r[i + 1].close)));
+      count++;
+      if(count <= InpAtrLen) { sum += tr; if(count == InpAtrLen) atr = sum / InpAtrLen; }
+      else atr = (atr * (InpAtrLen - 1) + tr) / InpAtrLen;
+   }
+   return atr;
+}
+
+// Daily trend for the day containing barTime: previous daily close vs its average of trendDays closes.
+int TrendDir(datetime barTime, double &distPct)
+{
+   distPct = 0;
+   int sh = iBarShift(_Symbol, PERIOD_D1, barTime, false);
+   if(sh < 0) return 0;
+   double c[];
+   ArraySetAsSeries(c, true);
+   if(CopyClose(_Symbol, PERIOD_D1, sh + 1, InpTrendDays, c) < InpTrendDays) return 0;
+   double sma = 0;
+   for(int i = 0; i < InpTrendDays; i++) sma += c[i];
+   sma /= InpTrendDays;
+   if(sma <= 0) return 0;
+   distPct = (c[0] - sma) / sma * 100;
+   if(!InpUseTrend) return 0;
+   int dir = distPct > 0 && distPct >= InpNeutralBand ? 1 : distPct < 0 && distPct <= -InpNeutralBand ? -1 : 0;
+   if(dir == 0) return 0;
+   // optional regime filters, all from the previous (closed) daily bar
+   if(InpAdxMin > 0 && g_adxH != INVALID_HANDLE)
+   {
+      double a[];
+      if(CopyBuffer(g_adxH, 0, sh + 1, 1, a) < 1 || a[0] < InpAdxMin) return 0;
+   }
+   if(InpEmaSepPct >= 0 && g_emaH != INVALID_HANDLE)
+   {
+      double e[];
+      if(CopyBuffer(g_emaH, 0, sh + 1, 1, e) < 1 || e[0] <= 0) return 0;
+      double sep = (c[0] - e[0]) / e[0] * 100 * dir;       // positive = on the trend's side
+      if(sep < InpEmaSepPct) return 0;
+   }
+   return dir;
+}
+
+//+------------------------------------------------------------------+
+// Money lost by 1 lot if price moves dist against it, from the terminal's own profit calculation
+// (tick value alone was 10x off for XAUUSD in the tester - positions came out 10x too large).
+double LossPerLot(double dist)
+{
+   MqlTick t;
+   if(!SymbolInfoTick(_Symbol, t) || dist <= 0) return 0;
+   double price = t.ask > 0 ? t.ask : t.bid;
+   double pnl = 0;
+   if(!OrderCalcProfit(ORDER_TYPE_BUY, _Symbol, 1.0, price, price - dist, pnl)) return 0;
+   return MathAbs(pnl);
+}
+
+// Startup check: the two ways of pricing a stop must agree, otherwise sizing cannot be trusted.
+void CheckSizing()
+{
+   double viaCalc = LossPerLot(10.0);
+   double viaContract = 10.0 * SymbolInfoDouble(_Symbol, SYMBOL_TRADE_CONTRACT_SIZE);
+   string msg = StringFormat("sizing check: a $10 move on 1 lot = %.2f (profit calc) vs %.2f (contract size %.0f)",
+                             viaCalc, viaContract, SymbolInfoDouble(_Symbol, SYMBOL_TRADE_CONTRACT_SIZE));
+   if(viaCalc <= 0 || MathAbs(viaCalc - viaContract) > 0.05 * viaContract) LogEvent("WARNING", msg + " - they disagree, check the symbol");
+   else Print(msg);
+}
+
+// Lots so that a stop dist away loses riskPct of the initial balance, rounded down to the lot step.
+double LotsFor(double riskPct, double dist, double &takenPct)
+{
+   takenPct = 0;
+   double lpl = LossPerLot(dist);
+   if(lpl <= 0 || g_initBal <= 0) return 0;
+   double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double vmin = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double vmax = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lots = MathFloor(g_initBal * riskPct / 100.0 / lpl / step) * step;
+   lots = MathMax(lots, vmin);
+   lots = MathMin(lots, vmax);
+   lots = NormalizeDouble(lots, 2);
+   takenPct = lots * lpl / g_initBal * 100;
+   return lots;
+}
+
+double RiskNow(bool targetHit)
+{
+   if(g_initBal <= 0) return 0;
+   double totalLoss = (g_initBal - AccountInfoDouble(ACCOUNT_EQUITY)) / g_initBal * 100;
+   double room = InpTotalLimitPct - totalLoss;
+   double r = InpRiskMode == RISK_FIXED ? InpRiskPercent : MathMax(MathMin(InpMaxRiskPct, room / InpRiskDivisor), InpMinRiskPct);
+   if(targetHit) r = MathMin(r, InpPostTargetRisk);
+   return r;
+}
+
+//+------------------------------------------------------------------+
+int CountPositions(double &firstPrice, double &firstSL, datetime &firstTime, int &dir)
+{
+   int n = 0;
+   firstTime = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong tk = PositionGetTicket(i);
+      if(tk == 0 || PositionGetString(POSITION_SYMBOL) != _Symbol || PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+      n++;
+      datetime t = (datetime)PositionGetInteger(POSITION_TIME);
+      if(firstTime == 0 || t < firstTime)
+      {
+         firstTime = t;
+         firstPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+         firstSL = PositionGetDouble(POSITION_SL);
+         dir = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ? 1 : -1;
+      }
+   }
+   return n;
+}
+
+// Open risk (% of initial balance) of every position on the account that is NOT this EA's gold trade,
+// e.g. the Nasdaq companion EA: loss if each of their stops is hit from the current price.
+double OtherOpenRisk()
+{
+   double sum = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong tk = PositionGetTicket(i);
+      if(tk == 0) continue;
+      string sym = PositionGetString(POSITION_SYMBOL);
+      if(sym == _Symbol && PositionGetInteger(POSITION_MAGIC) == InpMagic) continue;
+      double vol = PositionGetDouble(POSITION_VOLUME), sl = PositionGetDouble(POSITION_SL), cur = PositionGetDouble(POSITION_PRICE_CURRENT);
+      bool isLong = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY;
+      double to = sl > 0 ? sl : (isLong ? cur * 0.98 : cur * 1.02);
+      double pnl = 0;
+      if(OrderCalcProfit(isLong ? ORDER_TYPE_BUY : ORDER_TYPE_SELL, sym, vol, cur, to, pnl) && pnl < 0) sum += -pnl;
+   }
+   return g_initBal > 0 ? sum / g_initBal * 100 : 0;
+}
+
+void CloseAll(const string reason)
+{
+   g_nextCloseReason = reason;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong tk = PositionGetTicket(i);
+      if(tk == 0 || PositionGetString(POSITION_SYMBOL) != _Symbol || PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+      if(!trade.PositionClose(tk)) LogEvent("ERROR", StringFormat("close %I64u failed: %d %s", tk, trade.ResultRetcode(), trade.ResultRetcodeDescription()));
+   }
+   DeletePending("");
+   if(g_dir != 0) LogEvent("EXIT", reason);
+   g_dir = 0;
+   g_added = false;
+}
+
+// Delete this EA's pending orders whose comment contains tag ("" = all).
+void DeletePending(const string tag)
+{
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong tk = OrderGetTicket(i);
+      if(tk == 0 || OrderGetString(ORDER_SYMBOL) != _Symbol || OrderGetInteger(ORDER_MAGIC) != InpMagic) continue;
+      if(tag != "" && StringFind(OrderGetString(ORDER_COMMENT), tag) < 0) continue;
+      trade.OrderDelete(tk);
+   }
+}
+
+void SetStopAll(double sl)
+{
+   sl = NormalizeDouble(sl, _Digits);
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong tk = PositionGetTicket(i);
+      if(tk == 0 || PositionGetString(POSITION_SYMBOL) != _Symbol || PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+      double cur = PositionGetDouble(POSITION_SL);
+      bool isLong = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY;
+      bool tighter = cur == 0 || (isLong ? sl > cur + _Point / 2 : sl < cur - _Point / 2);
+      if(!tighter) continue;
+      if(!trade.PositionModify(tk, sl, PositionGetDouble(POSITION_TP)))
+         LogEvent("ERROR", StringFormat("modify SL %I64u -> %.2f failed: %d %s", tk, sl, trade.ResultRetcode(), trade.ResultRetcodeDescription()));
+   }
+}
+
+// Stop order at trig (market order if price is already through it), valid until expiry.
+// When price is already through the level the entry is further from the (unchanged) stop, so
+// the size is recomputed from the actual distance: the stop stays where the strategy puts it,
+// only the position shrinks, and the trade still risks riskPct (it used to risk up to ~2x).
+bool SendStop(int dir, double trig, double sl, double lots, const string comment, datetime expiry, double riskPct)
+{
+   MqlTick t;
+   if(!SymbolInfoTick(_Symbol, t)) return false;
+   trig = NormalizeDouble(trig, _Digits);
+   sl = NormalizeDouble(sl, _Digits);
+   double lvl = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+   long expMode = SymbolInfoInteger(_Symbol, SYMBOL_EXPIRATION_MODE);
+   ENUM_ORDER_TYPE_TIME tt = (expMode & SYMBOL_EXPIRATION_SPECIFIED) != 0 ? ORDER_TIME_SPECIFIED : ORDER_TIME_GTC;
+   bool atMarket = dir == 1 ? t.ask >= trig - lvl : t.bid <= trig + lvl;
+   if(atMarket)
+   {
+      double px = dir == 1 ? t.ask : t.bid;
+      double dist = dir == 1 ? px - sl : sl - px;
+      if(dist <= 0) return false;                 // already beyond the stop: no trade
+      double taken;
+      double mLots = LotsFor(riskPct, dist, taken);
+      lots = MathMin(lots, mLots);
+   }
+   bool ok;
+   if(dir == 1)
+      ok = atMarket ? trade.Buy(lots, _Symbol, 0, sl, 0, comment)
+                    : trade.BuyStop(lots, trig, _Symbol, sl, 0, tt, tt == ORDER_TIME_SPECIFIED ? expiry : 0, comment);
+   else
+      ok = atMarket ? trade.Sell(lots, _Symbol, 0, sl, 0, comment)
+                    : trade.SellStop(lots, trig, _Symbol, sl, 0, tt, tt == ORDER_TIME_SPECIFIED ? expiry : 0, comment);
+   if(!ok) LogEvent("ERROR", StringFormat("%s %s %.2f lots at %.2f SL %.2f failed: %d %s", comment, dir == 1 ? "buy" : "sell",
+                    lots, trig, sl, trade.ResultRetcode(), trade.ResultRetcodeDescription()));
+   return ok;
+}
+
+//+------------------------------------------------------------------+
+void UpdateDay()
+{
+   int key = PragueDayKey(TimeCurrent());
+   if(key != g_dayKey)
+   {
+      g_dayKey = key;
+      g_dayStart = MathMax(AccountInfoDouble(ACCOUNT_BALANCE), AccountInfoDouble(ACCOUNT_EQUITY));
+      GVSet("dayKey", g_dayKey);
+      GVSet("dayStart", g_dayStart);
+   }
+}
+
+void Losses(double &dayLoss, double &totalLoss)
+{
+   dayLoss = 0; totalLoss = 0;
+   if(g_initBal <= 0) return;
+   double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+   dayLoss = (g_dayStart - eq) / g_initBal * 100;
+   totalLoss = (g_initBal - eq) / g_initBal * 100;
+}
+
+// Emergency switch: while Common\Files\GoldBreakout\halt.flag exists everything is closed and nothing opens.
+bool Halted()
+{
+   static datetime lastCheck = 0;
+   static bool halted = false;
+   if(IsTester()) return false;
+   if(TimeLocal() - lastCheck >= 2)
+   {
+      lastCheck = TimeLocal();
+      bool now = FileIsExist("GoldBreakout\\halt.flag", FILE_COMMON);
+      if(now != halted) LogEvent(now ? "STOP" : "START", now ? "HALT switch on - positions closed, no new trades" : "HALT switch off - trading resumed");
+      halted = now;
+   }
+   return halted;
+}
+
+// Checks that must run on every tick: loss limits, profit target, daily close, news, breakeven after the add.
+// trading-session day: New York day rolled at 17:00 (gold's daily break)
+int SessionKey(datetime t) { return (int)((ToNY(t) + 7 * 3600) / 86400); }
+
+void TickGuards()
+{
+   if(Halted())
+   {
+      double hp, hsl; datetime ht; int hd = 0;
+      if(CountPositions(hp, hsl, ht, hd) > 0 || OrdersTotal() > 0) CloseAll("Halt switch");
+      return;
+   }
+   UpdateDay();
+   double dayLoss, totalLoss;
+   Losses(dayLoss, totalLoss);
+   double fp, fsl; datetime ft; int d = 0;
+   int n = CountPositions(fp, fsl, ft, d);
+   bool busy = n > 0 || OrdersTotal() > 0;
+   datetime now = TimeCurrent();
+
+   if(InpPropRules && (dayLoss >= InpDailyLimitPct || totalLoss >= InpTotalLimitPct))
+   {
+      if(busy) { CloseAll(dayLoss >= InpDailyLimitPct ? "Daily loss limit" : "Max loss limit"); }
+      if(totalLoss >= InpTotalLimitPct && !g_limitStop) { g_limitStop = true; GVSet("limitStop", 1); LogEvent("STOP", "Max loss limit reached - trading stopped"); }
+      return;
+   }
+   if(InpChallengeMode && InpPropRules)
+   {
+      double gain = -totalLoss;
+      if(!g_passed && gain >= InpProfitTarget && g_tradingDays >= InpMinTradingDays)
+      {
+         g_passed = true;
+         GVSet("passed", 1);
+         if(busy) CloseAll("Target reached");
+         LogEvent("TARGET", StringFormat("Profit target %.1f%% reached (%.2f%%) - trading stopped", InpProfitTarget, gain));
+         return;
+      }
+   }
+   if(InpFlatBeforeClose && busy)
+   {
+      int m = NYMinutes(now);
+      if(m >= 17 * 60 - InpFlatMinutes && m < 18 * 60) { CloseAll("Market close"); return; }
+      // safety net: a position that is still open from an earlier session (no tick arrived in the
+      // closing window, e.g. a thin market or a disconnect) is closed at the first chance
+      if(n > 0 && SessionKey(ft) != SessionKey(now)) { CloseAll("Missed market close"); return; }
+   }
+   if(busy && NearNews(now))
+   {
+      // flat before the event; after it only entries are blocked, which the bar logic handles
+      bool before = false;
+      for(int i = 0; i < ArraySize(g_newsServer); i++)
+         if(g_newsServer[i] - now <= InpNewsBeforeMin * 60 && g_newsServer[i] >= now) before = true;
+      if(before) { CloseAll("News"); return; }
+   }
+   // the add has filled: the whole trade's stop goes to at least the first entry, straight away
+   if(n >= 2 && g_dir != 0)
+   {
+      if(!g_added) { g_added = true; GVSet("added", 1); LogEvent("ADD", StringFormat("added to %s at +%.1fR", g_dir == 1 ? "long" : "short", InpAddAtR)); }
+      double be = g_dir == 1 ? MathMax(g_stop, g_entry) : MathMin(g_stop, g_entry);
+      g_stop = be;
+      SetStopAll(be);
+   }
+}
+
+//+------------------------------------------------------------------+
+// PAPER-TRADING ENGINE. Runs the strategy on every signal, in every session, without guards or
+// sizing, one closed bar at a time (same order of events as the research simulator). Its recent
+// results tell whether the market is currently rewarding the strategy.
+void PaperClose(datetime t, double px)
+{
+   for(int i = 0; i < ArraySize(sh_units); i++)
+   {
+      int k = ArraySize(sh_closedR);
+      ArrayResize(sh_closedR, k + 1); ArrayResize(sh_closedAt, k + 1); ArrayResize(sh_openedAt, k + 1);
+      sh_closedR[k] = ((px - sh_units[i].entry) * sh_dir - InpPaperCost) / sh_units[i].risk;
+      sh_closedAt[k] = t;
+      sh_openedAt[k] = sh_units[i].opened;
+   }
+   ArrayResize(sh_units, 0);
+   sh_dir = 0;
+}
+
+void PaperStep(int s)
+{
+   datetime bt = iTime(_Symbol, PERIOD_CURRENT, s);
+   if(bt <= sh_lastBar) return;
+   sh_lastBar = bt;
+   int per = PeriodSeconds();
+   datetime bc = bt + per;
+   double o = iOpen(_Symbol, PERIOD_CURRENT, s), h = iHigh(_Symbol, PERIOD_CURRENT, s);
+   double l = iLow(_Symbol, PERIOD_CURRENT, s), c = iClose(_Symbol, PERIOD_CURRENT, s);
+   int cm = NYMinutes(bc);
+   bool closing = InpFlatBeforeClose && cm > 16 * 60 + 45 && cm <= 18 * 60;
+
+   // 1. stop inside the bar
+   if(sh_dir != 0 && (sh_dir == 1 ? l <= sh_stop : h >= sh_stop))
+      PaperClose(bc, sh_dir == 1 ? MathMin(o, sh_stop) : MathMax(o, sh_stop));
+   // 2. add to the winner at +addAtR R, stop to breakeven
+   if(sh_dir != 0 && ArraySize(sh_units) == 1 && InpAddAtR > 0 && bt > sh_entryBar && !closing)
+   {
+      double lvl = sh_entry0 + sh_dir * InpAddAtR * sh_risk0;
+      if(sh_dir == 1 ? h >= lvl : l <= lvl)
+      {
+         double fill = sh_dir == 1 ? MathMax(o, lvl) : MathMin(o, lvl);
+         sh_stop = sh_dir == 1 ? MathMax(sh_stop, sh_entry0) : MathMin(sh_stop, sh_entry0);
+         double rk = MathAbs(fill - sh_stop);
+         if(rk > 0) { int k = ArraySize(sh_units); ArrayResize(sh_units, k + 1); sh_units[k].entry = fill; sh_units[k].risk = rk; sh_units[k].opened = bt; }
+      }
+   }
+   // 3. flat at the daily close / around news (decided at the bar close)
+   if(sh_dir != 0 && (closing || NearNews(bc))) PaperClose(bc, c);
+   double atr = AtrRma(s);
+   // 4. trailing stop from the bar after the fill
+   if(sh_dir != 0 && bt > sh_entryBar && atr > 0)
+   {
+      int es = iBarShift(_Symbol, PERIOD_CURRENT, sh_entryBar, false);
+      int cnt = es - s + 1;
+      if(cnt >= 1)
+      {
+         double ext = sh_dir == 1 ? iHigh(_Symbol, PERIOD_CURRENT, iHighest(_Symbol, PERIOD_CURRENT, MODE_HIGH, cnt, s))
+                                  : iLow(_Symbol, PERIOD_CURRENT, iLowest(_Symbol, PERIOD_CURRENT, MODE_LOW, cnt, s));
+         double tr = sh_dir == 1 ? ext - InpTrailAtr * atr : ext + InpTrailAtr * atr;
+         sh_stop = sh_dir == 1 ? MathMax(sh_stop, tr) : MathMin(sh_stop, tr);
+      }
+   }
+   // 5. entry orders placed at the previous close fill inside this bar
+   if(sh_dir == 0)
+      for(int i = 0; i < sh_nOrd; i++)
+      {
+         int d = sh_ordDir[i];
+         if(d == 1 ? h >= sh_ordTrig[i] : l <= sh_ordTrig[i])
+         {
+            double fill = d == 1 ? MathMax(o, sh_ordTrig[i]) : MathMin(o, sh_ordTrig[i]);
+            double rk = MathAbs(fill - sh_ordStop[i]);
+            if(rk <= 0 || (d == 1 ? sh_ordStop[i] >= fill : sh_ordStop[i] <= fill)) continue;
+            sh_dir = d; sh_entry0 = fill; sh_risk0 = rk; sh_stop = sh_ordStop[i]; sh_entryBar = bt;
+            ArrayResize(sh_units, 1); sh_units[0].entry = fill; sh_units[0].risk = rk; sh_units[0].opened = bt;
+            if(d == 1 ? c <= sh_stop : c >= sh_stop) PaperClose(bc, sh_stop);   // stopped in the fill bar
+            break;
+         }
+      }
+   // 6. new entry orders for the next bar, only while flat
+   sh_nOrd = 0;
+   int nm = NYMinutes(bc + per);
+   bool nextClosing = InpFlatBeforeClose && nm > 16 * 60 + 45 && nm <= 18 * 60;
+   if(sh_dir == 0 && !closing && !nextClosing && !NearNews(bc) && atr > 0)
+   {
+      int chanLen = (int)MathMax(MathRound(InpChanHours * 3600.0 / per), 2);
+      int hi = iHighest(_Symbol, PERIOD_CURRENT, MODE_HIGH, chanLen, s);
+      int lo = iLowest(_Symbol, PERIOD_CURRENT, MODE_LOW, chanLen, s);
+      double dist;
+      int trend = TrendDir(bt, dist);
+      int hiG = iHighest(_Symbol, PERIOD_CURRENT, MODE_HIGH, chanLen, s + 1);   // level without bar s
+      int loG = iLowest(_Symbol, PERIOD_CURRENT, MODE_LOW, chanLen, s + 1);
+      bool longCloseOk  = (InpCloseMinAtr < 0) || (hiG >= 0 && c >= iHigh(_Symbol, PERIOD_CURRENT, hiG) + InpCloseMinAtr * atr);
+      bool shortCloseOk = (InpCloseMinAtr < 0) || (loG >= 0 && c <= iLow(_Symbol, PERIOD_CURRENT, loG) - InpCloseMinAtr * atr);
+      if(hi >= 0 && (!InpUseTrend || trend == 1) && longCloseOk)
+      { double t = iHigh(_Symbol, PERIOD_CURRENT, hi) + InpBufAtr * atr; sh_ordDir[sh_nOrd] = 1; sh_ordTrig[sh_nOrd] = t; sh_ordStop[sh_nOrd] = t - InpStopAtr * atr; sh_nOrd++; }
+      if(lo >= 0 && (!InpUseTrend || trend == -1) && shortCloseOk)
+      { double t = iLow(_Symbol, PERIOD_CURRENT, lo) - InpBufAtr * atr; sh_ordDir[sh_nOrd] = -1; sh_ordTrig[sh_nOrd] = t; sh_ordStop[sh_nOrd] = t + InpStopAtr * atr; sh_nOrd++; }
+   }
+}
+
+// Bring the paper engine up to the last closed bar (replays history on start or after a gap), then
+// judge the regime from the paper units closed in the last InpRegimeDays days.
+void PaperCatchUp()
+{
+   int start;
+   if(sh_lastBar == 0)
+      start = iBarShift(_Symbol, PERIOD_CURRENT, iTime(_Symbol, PERIOD_CURRENT, 1) - (InpRegimeDays + 45) * 86400, false);
+   else
+      start = iBarShift(_Symbol, PERIOD_CURRENT, sh_lastBar, false) - 1;
+   for(int s = start; s >= 1; s--) PaperStep(s);
+
+   datetime now = iTime(_Symbol, PERIOD_CURRENT, 1) + PeriodSeconds();
+   double sum = 0;
+   int n = 0;
+   for(int i = ArraySize(sh_closedR) - 1; i >= 0; i--)
+   {
+      if(sh_closedAt[i] < now - InpRegimeDays * 86400) break;
+      if(sh_closedAt[i] <= now) { sum += sh_closedR[i]; n++; }
+   }
+   bool bad = n >= InpRegimeMinTrades && sum < 0;
+   if(bad != g_badRegime && !IsTester() && g_paperReady)     // the first judgement is announced by TryPaperInit
+      LogEvent("REGIME", bad ? StringFormat("BAD regime (paper %d-day result %.1fR over %d trades) - " + BadModeText(),
+                                           InpRegimeDays, sum, n)
+                             : StringFormat("GOOD regime again (paper %d-day result %+.1fR over %d trades) - all sessions", InpRegimeDays, sum, n));
+   g_badRegime = bad;
+   g_regimeR = sum;
+   g_regimeN = n;
+}
+
+// Enough price history for the daily trend / EMA and the paper replay? Asking for it also makes the
+// terminal download older bars from the broker (a fresh terminal only holds recent history).
+bool g_paperReady = false;
+bool g_historyReady = false;
+bool HistoryReady()
+{
+   datetime t[];
+   int needD1 = (InpEmaSepPct >= 0 ? MathMax(InpEmaLen, InpTrendDays) : InpTrendDays) + 10;
+   int needH1 = (int)(24.0 * (InpRegimeDays + 45) * 5.0 / 7.0);
+   int d1 = CopyTime(_Symbol, PERIOD_D1, 0, needD1 + 20, t);
+   int h1 = CopyTime(_Symbol, PERIOD_CURRENT, 0, needH1 + 200, t);
+   g_historyReady = d1 >= needD1 && h1 >= needH1;
+   return g_historyReady;
+}
+
+void TryPaperInit()
+{
+   if(g_paperReady) return;
+   if(!HistoryReady()) return;
+   if(!InpRegimeFilter) { g_paperReady = true; return; }
+   PaperCatchUp();
+   g_paperReady = true;
+   if(!IsTester())
+      LogEvent("REGIME", StringFormat("%s (paper %d-day result %+.1fR over %d trades)",
+               g_badRegime ? "BAD regime - " + BadModeText() : "GOOD regime - all sessions, full risk", InpRegimeDays, g_regimeR, g_regimeN));
+}
+
+//+------------------------------------------------------------------+
+// Decisions taken once per bar, on the first tick after the bar closed (mirrors the Pine script).
+void OnBarClose()
+{
+   TryPaperInit();
+   PaperCatchUp();
+   if(Halted()) return;
+   datetime bar1 = iTime(_Symbol, PERIOD_CURRENT, 1);
+   int per = PeriodSeconds();
+   datetime bar1Close = bar1 + per;
+   double atr = AtrRma(1);
+   int chanLen = (int)MathMax(MathRound(InpChanHours * 3600.0 / per), 2);
+   int hi = iHighest(_Symbol, PERIOD_CURRENT, MODE_HIGH, chanLen, 1);
+   int lo = iLowest(_Symbol, PERIOD_CURRENT, MODE_LOW, chanLen, 1);
+   if(hi < 0 || lo < 0 || atr <= 0) return;
+   double chanHigh = iHigh(_Symbol, PERIOD_CURRENT, hi);
+   double chanLow = iLow(_Symbol, PERIOD_CURRENT, lo);
+   double distPct;
+   int trend = TrendDir(bar1, distPct);
+   bool longOk = InpUseTrend ? trend == 1 : true;
+   bool shortOk = InpUseTrend ? trend == -1 : true;
+
+   int closeMin = NYMinutes(bar1Close);
+   bool closingBar = InpFlatBeforeClose && closeMin > 16 * 60 + 45 && closeMin <= 18 * 60;
+   int nextMin = NYMinutes(bar1Close + per);
+   bool nextClosing = InpFlatBeforeClose && nextMin > 16 * 60 + 45 && nextMin <= 18 * 60;
+   bool nearNews = NearNews(bar1Close);
+
+   UpdateDay();
+   double dayLoss, totalLoss;
+   Losses(dayLoss, totalLoss);
+   bool limitHit = InpPropRules && (dayLoss >= InpDailyLimitPct || totalLoss >= InpTotalLimitPct || g_limitStop);
+   bool targetHit = InpPropRules && InpChallengeMode && -totalLoss >= InpProfitTarget;
+   double riskNow = RiskNow(targetHit);
+   if(InpRegimeFilter && g_badRegime && InpBadMode == BAD_REDUCED_RISK) riskNow *= InpBadRiskMult;
+
+   // --- position state --------------------------------------------------------------------------
+   double fp = 0, fsl = 0; datetime ft = 0; int d = 0;
+   int n = CountPositions(fp, fsl, ft, d);
+   if(g_dir == 0 && n > 0)
+   {
+      g_dir = d; g_entry = fp; g_stop0 = fsl; g_stop = fsl; g_added = n >= 2;
+      g_entryBar = iTime(_Symbol, PERIOD_CURRENT, iBarShift(_Symbol, PERIOD_CURRENT, ft, false));
+      GVSet("entry", g_entry); GVSet("stop0", g_stop0); GVSet("entryBar", (double)g_entryBar); GVSet("added", g_added);
+   }
+   if(g_dir != 0 && n == 0) { g_dir = 0; g_added = false; g_added2 = false; }
+
+   string exitReason = limitHit ? "Loss limit" : g_passed ? "Target reached" : nearNews ? "News" : closingBar ? "Market close" : "";
+   if(g_dir != 0 && exitReason != "") CloseAll(exitReason);
+
+   // --- trailing stop, breakeven after the add ----------------------------------------------------
+   if(g_dir != 0)
+   {
+      int eShift = iBarShift(_Symbol, PERIOD_CURRENT, g_entryBar, false);
+      if(eShift >= 1)
+      {
+         double ext = g_dir == 1 ? iHigh(_Symbol, PERIOD_CURRENT, iHighest(_Symbol, PERIOD_CURRENT, MODE_HIGH, eShift, 1))
+                                 : iLow(_Symbol, PERIOD_CURRENT, iLowest(_Symbol, PERIOD_CURRENT, MODE_LOW, eShift, 1));
+         if(eShift > 1)   // bar1 is after the fill bar
+         {
+            double trail = g_dir == 1 ? ext - InpTrailAtr * atr : ext + InpTrailAtr * atr;
+            g_stop = g_dir == 1 ? MathMax(g_stop, trail) : MathMin(g_stop, trail);
+         }
+      }
+      if(g_added && InpBeAfterAdd) g_stop = g_dir == 1 ? MathMax(g_stop, g_entry) : MathMin(g_stop, g_entry);
+      SetStopAll(g_stop);
+   }
+
+   datetime expiry = iTime(_Symbol, PERIOD_CURRENT, 0) + per;   // orders live for the current bar only
+   if(expiry <= TimeCurrent()) expiry = TimeCurrent() + per;
+
+   // --- add to the winner --------------------------------------------------------------------------
+   DeletePending("GTB Add");
+   if(g_dir != 0 && g_added && !g_added2 && InpAdd2AtR > 0 && n == 2)
+   {
+      double r02 = MathAbs(g_entry - g_stop0);
+      double addLvl2 = g_entry + g_dir * InpAdd2AtR * r02;
+      double addStop2 = InpBeAfterAdd ? (g_dir == 1 ? MathMax(g_stop, g_entry) : MathMin(g_stop, g_entry)) : g_stop;
+      double addDist2 = MathAbs(addLvl2 - addStop2);
+      double taken2; double lots2 = addDist2 > 0 ? LotsFor(riskNow, addDist2, taken2) : 0;
+      double others2 = OtherOpenRisk();
+      bool fits2 = !InpPropRules || (dayLoss + others2 + taken2 <= InpDailyLimitPct && totalLoss + others2 + taken2 <= InpTotalLimitPct);
+      if(lots2 > 0 && fits2 && !nearNews && !closingBar && !nextClosing && !limitHit && !g_passed)
+         if(SendStop(g_dir, addLvl2, addStop2, lots2, "GTB Add2", expiry, riskNow))
+            { g_added2 = true; LogEvent("ADD", StringFormat("second add at +%.1fR", InpAdd2AtR)); }
+   }
+   if(g_dir != 0 && !g_added && InpAddAtR > 0 && n == 1)
+   {
+      double r0 = MathAbs(g_entry - g_stop0);
+      double addLvl = g_entry + g_dir * InpAddAtR * r0;
+      double addStop = InpBeAfterAdd ? (g_dir == 1 ? MathMax(g_stop, g_entry) : MathMin(g_stop, g_entry)) : g_stop;
+      double addDist = MathAbs(addLvl - addStop);
+      double taken;
+      double lots = addDist > 0 ? LotsFor(riskNow * InpEntryFrac, addDist, taken) : 0;
+      double others = OtherOpenRisk();
+      bool fits = !InpPropRules || (dayLoss + others + taken <= InpDailyLimitPct && totalLoss + others + taken <= InpTotalLimitPct);
+      if(lots > 0 && fits && !nearNews && !closingBar && !nextClosing && !limitHit && !g_passed)
+         SendStop(g_dir, addLvl, addStop, lots, "GTB Add", expiry, riskNow);
+   }
+
+   // --- entries, only while flat ----------------------------------------------------------------------
+   DeletePending("GTB Buy");
+   if(InpReentryEnable && g_reArmed)
+   {
+      bool fresh = g_reBar > 0 && (iTime(_Symbol, PERIOD_CURRENT, 0) - g_reBar) <= (datetime)(InpReentryBars * per);
+      if(g_dir == 0 && g_reDir != 0 && fresh && !nearNews && !closingBar && !nextClosing && !limitHit && !g_passed)
+      {
+         double rdist = InpReentryStopAtr * atr;
+         double taken2; double rlots = LotsFor(riskNow, rdist, taken2);
+         if(rlots > 0)
+         {
+            if(SendStop(g_reDir, g_rePrice, g_rePrice - g_reDir * rdist, rlots, "GTB Re", expiry, riskNow))
+               { g_reChain++; g_reArmed = false; LogEvent("ENTRY", StringFormat("re-entry %s at %.2f after the stop-out", g_reDir == 1 ? "buy" : "sell", g_rePrice)); }
+         }
+      }
+      if(!fresh) { g_reArmed = false; g_reDir = 0; }
+   }
+   if(g_reArmed && g_dir != 0) { g_reArmed = false; g_reDir = 0; }
+   DeletePending("GTB Sell");
+   if(g_dir == 0)
+   {
+      double stopDist = InpStopAtr * atr;
+      double longTrig = chanHigh + InpBufAtr * atr;
+      double shortTrig = chanLow - InpBufAtr * atr;
+      double taken;
+      double lots = LotsFor(riskNow * InpEntryFrac, stopDist, taken);
+      double others = OtherOpenRisk();   // e.g. an open Nasdaq trade counts against the same guards
+      bool riskFits = !InpPropRules || (dayLoss + others + taken <= InpDailyLimitPct && totalLoss + others + taken <= InpTotalLimitPct);
+      bool started = !InpChallengeMode || bar1Close >= InpChallengeStart;
+      // regime filter: in a bad regime only orders that work during the New York session
+      int nyHour = NYMinutes(bar1Close) / 60;              // hour of the bar these orders work in
+      bool sessionOk = !InpRegimeFilter || !g_badRegime || InpBadMode != BAD_NY_ONLY || (nyHour >= InpNYStartHour && nyHour < InpNYEndHour);
+      bool canEnter = started && lots > 0 && riskFits && sessionOk && !nearNews && !closingBar && !nextClosing && !limitHit && !g_passed;
+      int hiG = iHighest(_Symbol, PERIOD_CURRENT, MODE_HIGH, chanLen, 2);   // level without the bar that just closed
+      int loG = iLowest(_Symbol, PERIOD_CURRENT, MODE_LOW, chanLen, 2);
+      double c1 = iClose(_Symbol, PERIOD_CURRENT, 1);                       // where that bar left the price
+      bool longCloseOk  = (InpCloseMinAtr < 0) || (hiG >= 0 && c1 >= iHigh(_Symbol, PERIOD_CURRENT, hiG) + InpCloseMinAtr * atr);
+      bool shortCloseOk = (InpCloseMinAtr < 0) || (loG >= 0 && c1 <= iLow(_Symbol, PERIOD_CURRENT, loG) - InpCloseMinAtr * atr);
+      if(canEnter && longOk && longCloseOk) SendStop(1, longTrig, longTrig - stopDist, lots, "GTB Buy", expiry, riskNow);
+      if(canEnter && shortOk && shortCloseOk) SendStop(-1, shortTrig, shortTrig + stopDist, lots, "GTB Sell", expiry, riskNow);
+   }
+}
+
+//+------------------------------------------------------------------+
+// Heartbeat for the server watchdog, written every minute even while the market is closed.
+void WriteHeartbeat()
+{
+   if(IsTester()) return;
+   double dayLoss = 0, totalLoss = 0;
+   if(g_initBal > 0) Losses(dayLoss, totalLoss);
+   double fp, fsl; datetime ft; int d = 0;
+   int n = CountPositions(fp, fsl, ft, d);
+   MqlTick t;
+   SymbolInfoTick(_Symbol, t);
+   int h = FileOpen("GoldBreakout\\heartbeat.txt", FILE_WRITE | FILE_TXT | FILE_COMMON | FILE_ANSI);
+   if(h == INVALID_HANDLE) return;
+   FileWriteString(h, StringFormat(
+      "time_gmt=%s\nconnected=%d\nterminal_trade_allowed=%d\nea_trade_allowed=%d\naccount_trade_allowed=%d\n"
+      "login=%I64d\nserver=%s\nbalance=%.2f\nequity=%.2f\ninitial_balance=%.2f\nday_pl_pct=%.2f\ntotal_pl_pct=%.2f\n"
+      "positions=%d\ndirection=%d\ntrading_days=%d\npassed=%d\nlimit_stop=%d\nlast_tick_gmt=%s\nsymbol=%s\nperiod=%s\n"
+      "server_time=%s\nny_time_assumed=%s\nhalted=%d\nregime=%s\nregime_paper_r=%.2f\nregime_paper_trades=%d\nhistory_ready=%d\n",
+      TimeToString(TimeGMT(), TIME_DATE | TIME_SECONDS),
+      (int)TerminalInfoInteger(TERMINAL_CONNECTED), (int)TerminalInfoInteger(TERMINAL_TRADE_ALLOWED),
+      (int)MQLInfoInteger(MQL_TRADE_ALLOWED), (int)AccountInfoInteger(ACCOUNT_TRADE_ALLOWED),
+      AccountInfoInteger(ACCOUNT_LOGIN), AccountInfoString(ACCOUNT_SERVER),
+      AccountInfoDouble(ACCOUNT_BALANCE), AccountInfoDouble(ACCOUNT_EQUITY), g_initBal, -dayLoss, -totalLoss,
+      n, g_dir, g_tradingDays, (int)g_passed, (int)g_limitStop,
+      TimeToString(t.time - (TimeCurrent() - TimeGMT()), TIME_DATE | TIME_SECONDS), _Symbol, EnumToString(_Period),
+      TimeToString(TimeTradeServer(), TIME_DATE | TIME_SECONDS), TimeToString(ToNY(TimeTradeServer()), TIME_DATE | TIME_SECONDS),
+      (int)Halted(), !g_paperReady ? "unknown (waiting for history)" : g_badRegime ? "bad (" + BadModeText() + ")" : "good (all sessions)",
+      g_regimeR, g_regimeN, (int)g_historyReady));
+   FileClose(h);
+}
+
+datetime g_startLocal = 0;
+void OnTimer()
+{
+   static bool warned = false;
+   // the guards (close before 17:00 NY, loss limits, news) must not depend on a tick arriving in time
+   if(TerminalInfoInteger(TERMINAL_CONNECTED)) EnsureInitialBalance();   // no tick needed (weekend start)
+   if(g_initBal > 0 && TerminalInfoInteger(TERMINAL_CONNECTED)) TickGuards();
+   TryPaperInit();
+   if(!g_paperReady && !warned && TimeLocal() - g_startLocal > 600 && TerminalInfoInteger(TERMINAL_CONNECTED))
+   {
+      warned = true;
+      LogEvent("WARNING", "price history still incomplete after 10 minutes - the daily trend / 200 EMA and the regime filter need it");
+   }
+   WriteHeartbeat();
+}
+
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction &tr, const MqlTradeRequest &rq, const MqlTradeResult &rs)
+{
+   if(tr.type != TRADE_TRANSACTION_DEAL_ADD) return;
+   if(!HistoryDealSelect(tr.deal)) return;
+   if(HistoryDealGetInteger(tr.deal, DEAL_MAGIC) != InpMagic || HistoryDealGetString(tr.deal, DEAL_SYMBOL) != _Symbol) return;
+   long entry = HistoryDealGetInteger(tr.deal, DEAL_ENTRY);
+   ulong pos = HistoryDealGetInteger(tr.deal, DEAL_POSITION_ID);
+   if(entry == DEAL_ENTRY_IN)
+   {
+      if(StringFind(HistoryDealGetString(tr.deal, DEAL_COMMENT), "GTB Re") < 0) g_reChain = 0;
+      int day = PragueDayKey((datetime)HistoryDealGetInteger(tr.deal, DEAL_TIME));
+      if(day != g_lastTradeDay) { g_lastTradeDay = day; g_tradingDays++; GVSet("lastTradeDay", day); GVSet("tradingDays", g_tradingDays); }
+      double sl = 0;
+      if(PositionSelectByTicket(pos)) sl = PositionGetDouble(POSITION_SL);
+      int k = ArraySize(g_posIds);
+      ArrayResize(g_posIds, k + 1); ArrayResize(g_posSL, k + 1); ArrayResize(g_posWhy, k + 1);
+      g_posIds[k] = pos; g_posSL[k] = sl; g_posWhy[k] = "";
+      string c = HistoryDealGetString(tr.deal, DEAL_COMMENT);
+      LogEvent("ENTRY", StringFormat("%s %.2f lots at %.2f, stop %.2f (%s)", HistoryDealGetInteger(tr.deal, DEAL_TYPE) == DEAL_TYPE_BUY ? "BUY" : "SELL",
+               HistoryDealGetDouble(tr.deal, DEAL_VOLUME), HistoryDealGetDouble(tr.deal, DEAL_PRICE), sl, c));
+   }
+   else if(entry == DEAL_ENTRY_OUT)
+   {
+      long reason = HistoryDealGetInteger(tr.deal, DEAL_REASON);
+      // the position that just closed: an OUT deal of type BUY closes a short, and vice versa.
+      // (g_dir is only set at bar closes, so it is still 0 when a trade stops out inside its entry bar.)
+      int closedDir = HistoryDealGetInteger(tr.deal, DEAL_TYPE) == DEAL_TYPE_BUY ? -1 : 1;
+      if(InpReentryEnable && reason == DEAL_REASON_SL && g_reDir == 0)
+      {
+         g_reArmed = true; g_reDir = closedDir; g_rePrice = HistoryDealGetDouble(tr.deal, DEAL_PRICE);
+         g_reBar = (datetime)HistoryDealGetInteger(tr.deal, DEAL_TIME);
+      }
+      string why = reason == DEAL_REASON_SL ? "Stop" : g_nextCloseReason != "" ? g_nextCloseReason : "Close";
+      for(int i = 0; i < ArraySize(g_posIds); i++) if(g_posIds[i] == pos) g_posWhy[i] = why;
+      double pnl = HistoryDealGetDouble(tr.deal, DEAL_PROFIT) + HistoryDealGetDouble(tr.deal, DEAL_COMMISSION) + HistoryDealGetDouble(tr.deal, DEAL_SWAP);
+      LogEvent("CLOSE", StringFormat("%.2f lots at %.2f, P/L %.2f %s (%s)", HistoryDealGetDouble(tr.deal, DEAL_VOLUME),
+               HistoryDealGetDouble(tr.deal, DEAL_PRICE), pnl, AccountInfoString(ACCOUNT_CURRENCY), why));
+   }
+}
+
+//+------------------------------------------------------------------+
+void RestoreState()
+{
+   g_dayKey = (int)GVGet("dayKey", 0);
+   g_dayStart = GVGet("dayStart", 0);
+   g_tradingDays = (int)GVGet("tradingDays", 0);
+   g_lastTradeDay = (int)GVGet("lastTradeDay", 0);
+   g_passed = GVGet("passed", 0) > 0;
+   g_limitStop = GVGet("limitStop", 0) > 0;
+   double fp = 0, fsl = 0; datetime ft = 0; int d = 0;
+   int n = CountPositions(fp, fsl, ft, d);
+   if(n > 0)
+   {
+      g_dir = d;
+      g_entry = GVGet("entry", fp);
+      g_stop0 = GVGet("stop0", fsl);
+      g_stop = fsl;
+      g_entryBar = (datetime)GVGet("entryBar", (double)iTime(_Symbol, PERIOD_CURRENT, iBarShift(_Symbol, PERIOD_CURRENT, ft, false)));
+      g_added = n >= 2 || GVGet("added", 0) > 0;
+      LogEvent("RESTORE", StringFormat("resumed %s trade from %.2f, stop %.2f, %d position(s)", d == 1 ? "long" : "short", g_entry, g_stop, n));
+   }
+}
+
+int OnInit()
+{
+   if(_Period != PERIOD_H1 && _Period != PERIOD_M30)
+      Print("WARNING: built for H1 (M30 also tested). It lost money on M15 and below in testing.");
+   if(InpAdxMin > 0) g_adxH = iADXWilder(_Symbol, PERIOD_D1, 14);
+   if(InpEmaSepPct >= 0) g_emaH = iMA(_Symbol, PERIOD_D1, InpEmaLen, 0, MODE_EMA, PRICE_CLOSE);
+   trade.SetExpertMagicNumber(InpMagic);
+   trade.SetDeviationInPoints(InpDeviationPts);
+   trade.SetTypeFillingBySymbol(_Symbol);
+   if(IsTester())
+   {
+      GlobalVariablesDeleteAll(StringFormat("GTB_%I64d_", InpMagic));
+      g_initBal = InpInitialBalance > 0 ? InpInitialBalance : AccountInfoDouble(ACCOUNT_BALANCE);
+   }
+   else
+   {
+      // 0 until an account with a balance is connected; set on the first tick then (see EnsureInitialBalance)
+      g_initBal = InpInitialBalance > 0 ? InpInitialBalance : GVGet("initBal", 0);
+   }
+   RestoreState();
+   LoadNews();
+   g_startLocal = TimeLocal();
+   TryPaperInit();   // replays recent history once enough of it has been downloaded (retried by the timer)
+   datetime lastNews = 0;
+   for(int i = 0; i < ArraySize(g_newsServer); i++) lastNews = MathMax(lastNews, g_newsServer[i]);
+   if(InpNewsFilter && lastNews < TimeCurrent() && !IsTester())
+      LogEvent("WARNING", "every news event is in the past - update GoldBreakout\\news.txt");
+   if(!IsTester()) { EventSetTimer(60); WriteHeartbeat(); }
+   if(!IsTester() && !TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
+      LogEvent("WARNING", "Algo Trading is switched OFF in the terminal - the EA cannot trade");
+   LogEvent("START", StringFormat("%s %s, initial balance %s, risk %s, limits %.1f%%/%.1f%%, challenge mode %s, news flat %d min before / %d after",
+            _Symbol, EnumToString(_Period), g_initBal > 0 ? StringFormat("%.2f", g_initBal) : "not known yet (read when the account connects)",
+            InpRiskMode == RISK_SCALED ? "scaled" : "fixed", InpDailyLimitPct, InpTotalLimitPct, InpChallengeMode ? "on" : "off", InpNewsBeforeMin, InpNewsAfterMin));
+   return INIT_SUCCEEDED;
+}
+
+// The initial balance must be known before anything is sized or measured against the limits.
+bool EnsureInitialBalance()
+{
+   if(g_initBal > 0) return true;
+   double b = AccountInfoDouble(ACCOUNT_BALANCE);
+   if(b <= 0 || AccountInfoInteger(ACCOUNT_LOGIN) == 0) return false;
+   g_initBal = b;
+   GVSet("initBal", g_initBal);
+   LogEvent("START", StringFormat("initial balance set to %.2f (account %I64d) - set InpInitialBalance if this is not the account's starting balance",
+            g_initBal, AccountInfoInteger(ACCOUNT_LOGIN)));
+   return true;
+}
+
+void OnTick()
+{
+   if(!EnsureInitialBalance()) return;
+   static bool sizingChecked = false;
+   if(!sizingChecked) { CheckSizing(); sizingChecked = true; }
+   TickGuards();
+   datetime b = iTime(_Symbol, PERIOD_CURRENT, 0);
+   if(b != g_lastBar)
+   {
+      bool first = g_lastBar == 0;
+      g_lastBar = b;
+      if(!first || IsTester()) OnBarClose();
+   }
+}
+
+//+------------------------------------------------------------------+
+// Tester: write every closed position (New York times) to Common\Files\GoldBreakout\tester_trades.csv
+void OnDeinit(const int reason)
+{
+   if(!IsTester()) { EventKillTimer(); LogEvent("STOP", StringFormat("EA removed (reason %d)", reason)); return; }
+   if(!HistorySelect(0, TimeCurrent() + 86400)) return;
+   int h = FileOpen("GoldBreakout\\tester_trades.csv", FILE_WRITE | FILE_TXT | FILE_COMMON | FILE_ANSI);
+   if(h == INVALID_HANDLE) return;
+   FileWriteString(h, "entry_time_ny;exit_time_ny;dir;entry;exit;lots;profit;risk_usd;r;comment\n");
+   for(int i = 0; i < ArraySize(g_posIds); i++)
+   {
+      ulong pos = g_posIds[i];
+      datetime et = 0, xt = 0; double ep = 0, xp = 0, vol = 0, pnl = 0; int dir = 0;
+      int total = HistoryDealsTotal();
+      for(int k = 0; k < total; k++)
+      {
+         ulong dl = HistoryDealGetTicket(k);
+         if((ulong)HistoryDealGetInteger(dl, DEAL_POSITION_ID) != pos) continue;
+         pnl += HistoryDealGetDouble(dl, DEAL_PROFIT) + HistoryDealGetDouble(dl, DEAL_COMMISSION) + HistoryDealGetDouble(dl, DEAL_SWAP);
+         if(HistoryDealGetInteger(dl, DEAL_ENTRY) == DEAL_ENTRY_IN)
+         { et = (datetime)HistoryDealGetInteger(dl, DEAL_TIME); ep = HistoryDealGetDouble(dl, DEAL_PRICE); vol = HistoryDealGetDouble(dl, DEAL_VOLUME);
+           dir = HistoryDealGetInteger(dl, DEAL_TYPE) == DEAL_TYPE_BUY ? 1 : -1; }
+         else { xt = (datetime)HistoryDealGetInteger(dl, DEAL_TIME); xp = HistoryDealGetDouble(dl, DEAL_PRICE); }
+      }
+      if(xt == 0) continue;
+      double riskUsd = vol * LossPerLot(MathAbs(ep - g_posSL[i]));
+      FileWriteString(h, StringFormat("%s;%s;%s;%.3f;%.3f;%.2f;%.2f;%.2f;%.3f;%s\n",
+                      TimeToString(ToNY(et), TIME_DATE | TIME_MINUTES), TimeToString(ToNY(xt), TIME_DATE | TIME_MINUTES),
+                      dir == 1 ? "L" : "S", ep, xp, vol, pnl, riskUsd, riskUsd > 0 ? pnl / riskUsd : 0.0, g_posWhy[i]));
+   }
+   FileClose(h);
+   // paper-trading engine output, to check it against the real trades
+   h = FileOpen("GoldBreakout\\tester_paper.csv", FILE_WRITE | FILE_TXT | FILE_COMMON | FILE_ANSI);
+   if(h == INVALID_HANDLE) return;
+   FileWriteString(h, "entry_bar_ny;exit_ny;r\n");
+   for(int i = 0; i < ArraySize(sh_closedR); i++)
+      FileWriteString(h, StringFormat("%s;%s;%.3f\n", TimeToString(ToNY(sh_openedAt[i]), TIME_DATE | TIME_MINUTES),
+                      TimeToString(ToNY(sh_closedAt[i]), TIME_DATE | TIME_MINUTES), sh_closedR[i]));
+   FileClose(h);
+}
+//+------------------------------------------------------------------+

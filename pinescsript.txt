@@ -32,7 +32,7 @@ c_bg = color.new(color.blue, 100)
 
 
 
-strategy("Lux Algo Signals & Overlays [6.3] Strategy", "Lux Algo Signals & Overlays [6.3]", overlay = true, max_labels_count = 500, pyramiding = 0, initial_capital = 10000, default_qty_type = strategy.percent_of_equity, default_qty_value = 100, process_orders_on_close = true, calc_on_every_tick = false)
+strategy("Lux Algo Signals & Overlays [6.3] Strategy", "Lux Algo Signals & Overlays [6.3]", overlay = true, max_labels_count = 500, pyramiding = 0, initial_capital = 10000, default_qty_type = strategy.fixed, default_qty_value = 1, margin_long = 0, margin_short = 0, process_orders_on_close = true, calc_on_every_tick = false, commission_type = strategy.commission.cash_per_contract, commission_value = 0.15)
 
 //import Libraries
 
@@ -134,8 +134,6 @@ tpWarnSensitivity = input.string("Normal", "Warning Sensitivity", ["Early", "Nor
 
 tpWarnOnlyInProfit = input.bool(true, "Only Warn When In Profit", group = groupTakeProfit, tooltip = "Only takes the take profit exit while the trade is in profit. Turn this off to also close losing trades on the same reversal events.")
 
-tpUseTrailFlip = input.bool(true, "Include Smart Trail / Trend Catcher Flips", group = groupTakeProfit, tooltip = "Counts a Smart Trail or Trend Catcher flip against your position as a reversal. These turn on many trades that never reach the reversal zone, which is what gives the warning its coverage without resorting to a fixed distance rule.")
-
 tpWarnEverySignal = input.bool(false, "Show Best Exit In Hindsight (review only)", group = groupTakeProfit, tooltip = "HINDSIGHT ONLY - NOT A LIVE SIGNAL. Marks in grey the best price every profitable trade reached, drawn AFTER that trade has finished. Shown on every trade, including ones that already produced an orange warning, so you can see both on the same trade and judge how far the live warning sat from the ideal exit. It is worked out by looking back over the completed move, so it could not have been known at the time and must never be traded on.")
 
 
@@ -143,9 +141,78 @@ tpWarnEverySignal = input.bool(false, "Show Best Exit In Hindsight (review only)
 
 groupStrategy = "STRATEGY EXITS"
 
-profitLockAtr = input.float(1.0, "Profit Lock (ATR)", minval = 0, step = 0.25, group = groupStrategy, tooltip = "Once a trade has run this many ATR in its favour, giving back half of that run takes the profit with the yellow TAKE PROFIT label. Catches trades that turn round without printing one of the reversal events the take profit warning looks for. 0 switches it off.")
+maxStopAtr = input.float(1.5, "Max Stop Distance (ATR)", minval = 0, step = 0.25, group = groupStrategy, tooltip = "The initial stop is the trailing line behind the signals, but never further than this many ATR from the entry. The line averages about 2.5 ATR away; capping it at 1.5 lifted the Feb - Sep 2026 XAUUSD 15m replay from +31R to +72R with every month positive. 0 = always use the trailing line.")
+
+entryPullbackAtr = input.float(0.25, "Entry Pullback (ATR)", minval = 0, step = 0.05, group = groupStrategy, tooltip = "Instead of buying the signal candle's close, a limit order waits this many ATR better, keeping the same stop. The trade risks less for the same stop, so the position is larger and the same move is worth more R, and signals that never pull back are skipped. Replayed Feb - Sep 2026 XAUUSD 15m at 0.5% risk: profit factor 1.14 -> 1.36 and FTMO-style pass rate 78% -> 92%; 0.15 to 0.3 all worked. 0 = enter at the close.")
+
+pullbackBars = input.int(4, "Pullback Order Valid (bars)", minval = 1, maxval = 20, group = groupStrategy, tooltip = "The limit order is cancelled if it has not filled after this many bars, when an opposite signal prints, and before news or the daily close.")
+
+tpMinR = input.float(2.0, "Take Profit Min Profit (R)", minval = 0, step = 0.25, group = groupStrategy, tooltip = "The yellow take profit warning only closes the trade once it is at least this many R in profit (1R = entry to initial stop). Replayed Feb - Sep 2026 XAUUSD 15m, 2 to 3 all worked; lower values cut the few big winners that carry this strategy. Needs Only Warn When In Profit on.")
+
+breakevenR = input.float(0.0, "Breakeven At (R)", minval = 0, step = 0.25, group = groupStrategy, tooltip = "Moves the stop to the entry once the trade has closed this many R in profit. 0 = off (the default: with the tighter stop it only cut winners).")
+
+profitLockR = input.float(1.5, "Profit Lock Start (R)", minval = 0, step = 0.25, group = groupStrategy, tooltip = "Once a trade has closed this many R in profit, giving back the share below of its best run closes it. 0 = off. Without it, 21 of 111 trades on Apr - Sep 2026 XAUUSD 15m were 1R or more in profit and still closed as losses, most of them at the full stop. Starting at 1.5R with 40% give back: +46R instead of +40R, max drawdown 8R instead of 13R, and every month positive. Any start from 1.25R to 2R with 40% worked.")
+
+profitLockGiveBack = input.float(40, "Profit Lock Give Back (%)", minval = 5, maxval = 95, step = 5, group = groupStrategy, tooltip = "Share of the best run the trade may hand back after the profit lock has started. 40 tested best; 30 cut the big winners short and 50-60 gave too much back.")
+
+profitLockMode = input.string("On Close", "Profit Lock Mode", ["On Close", "Trailing Stop"], group = groupStrategy, tooltip = "On Close - the lock is checked on each bar close against the best close.\nTrailing Stop - once the lock starts, the stop order itself trails at Give Back % of the best price reached (highs / lows), so it triggers inside the bar and hands back less.")
+
+htfFilter = input.bool(false, "Higher Timeframe Trend Filter", inline = "htf", group = groupStrategy, tooltip = "Only takes longs while the higher timeframe's last closed bar is above its 50 EMA and shorts while it is below. Uses the last closed higher timeframe bar only, so it does not repaint.")
+
+htfTf = input.timeframe("60", "", inline = "htf", group = groupStrategy)
 
 exitOnFilteredFlip = input.bool(true, "Exit On Filtered Opposite Signal", group = groupStrategy, tooltip = "When the fakeout filter suppresses an opposite signal, the trailing stop behind the signals has still been crossed. On: the trade is closed there and no new trade is opened. Off: the trade is held until the next signal or another exit.")
+
+riskMode = input.string("Drawdown Scaled", "Risk Mode", ["Fixed", "Drawdown Scaled"], group = groupStrategy, tooltip = "Fixed - every trade risks Risk Per Trade.\nDrawdown Scaled - every trade risks the room left before the Max Loss Limit divided by Losses To Limit, kept between Min and Max Risk. It risks the most while the account is healthy and shrinks automatically after losses, so a losing streak cannot run the account into the limit. Replayed on Apr - Sep 2026 XAUUSD 15m it passed a 10% challenge within 30 days about as often as a fixed 1.25-1.5% risk, while failing in about 1% of runs instead of 25-30%.")
+
+riskPercent = input.float(0.5, "Risk Per Trade (%)", minval = 0.1, maxval = 10, step = 0.1, group = groupStrategy, tooltip = "Fixed mode. Every trade is sized so that hitting its stop loses this share of the initial balance (FTMO measures every limit from the initial balance). The stop is the trailing stop line behind the signals at the moment of entry (the level whose break flips the signal), or the TP/SL stop when TP/SL Points is On. Size = initial balance x risk / (stop distance x point value).")
+
+maxRiskPct = input.float(1.5, "Scaled: Max Risk (%)", minval = 0.1, maxval = 5, step = 0.05, group = groupStrategy, tooltip = "Drawdown Scaled mode. The most a single trade may risk, in % of the initial balance.")
+
+riskDivisor = input.float(6, "Scaled: Losses To Limit", minval = 2, maxval = 30, step = 0.5, group = groupStrategy, tooltip = "Drawdown Scaled mode. Risk per trade = room left before the Max Loss Limit / this value. With an 8% limit, 6 gives 1.33% at the start, 1.5% (the cap) after a +1% gain and 0.67% after a -4% loss. Higher = safer and slower. Replayed Apr - Sep 2026 XAUUSD 15m: 6 passed a 10% challenge within 30 days about half the time and almost never failed; 5 was faster but failed more, 8-10 slower.")
+
+minRiskPct = input.float(0.25, "Scaled: Min Risk (%)", minval = 0.05, maxval = 5, step = 0.05, group = groupStrategy, tooltip = "Drawdown Scaled mode. Risk never drops below this, so the account can still climb back out of a drawdown. A trade is still only opened when its full risk fits under the loss limits.")
+
+useSession = input.bool(false, "Skip Quiet Tokyo Hours (02:00-07:00 UTC)", group = groupStrategy, tooltip = "Signals from 02:00 to 07:00 UTC (11:00-16:00 Tokyo) still print but are not traded. Replayed on Feb - Sep 2026 XAUUSD 15m, the Tokyo open (00:00-02:00 UTC) was the strongest window of the day (profit factor 1.75), while the rest of the Tokyo session lost in both halves of the test (profit factor 0.78). Skipping it raised the total from +31R to +37R and cut the worst drawdown from 15R to 10R.")
+
+skipUsOpen = input.bool(true, "Skip US Data / NY Open", inline = "usopen", group = groupStrategy, tooltip = "Signals inside this New York time window still print but are not traded. The default 08:00-13:00 holds the 08:30 US data releases and the 09:30 cash open, where gold whipsaws through the trailing stop and flips the signal without follow-through. Apr - Sep 2026 XAUUSD 15m: trades entered 12:00-17:00 UTC lost 17R over 37 trades, in both halves of the test; skipping the window raised the total from +21R to +32R and cut the worst drawdown from 19R to 11R. Neighbouring windows (07:00-13:00 to 08:30-11:30) all helped.")
+
+usOpenWindow = input.session("0800-1300", "", inline = "usopen", group = groupStrategy)
+
+volFilter = input.bool(true, "Volatility Filter", group = groupStrategy, tooltip = "Only trades signals while volatility is in the middle of its recent range: the average close-to-close move of the last 20 bars must rank between the Min and Max percentile of the last 500 bars. The quietest stretches produce drifting signals and the wildest ones whipsaws. It is measured from closes, not ATR, because rollover spread spikes distort highs and lows on broker feeds. Checked on Feb - Sep 2026 XAUUSD 15m, on four copies with random candle noise, and on the OANDA trade list of this strategy: your unfiltered trades inside the band made +54R (profit factor 1.98), those outside lost 20R.")
+
+volMinPct = input.int(30, "Min Volatility Percentile", minval = 0, maxval = 100, group = groupStrategy)
+
+volMaxPct = input.int(80, "Max Volatility Percentile", minval = 0, maxval = 100, group = groupStrategy, tooltip = "Was 70. On Apr - Sep 2026 XAUUSD 15m raising it to 80 added about 8R with the lower bound at either 20 or 30, by keeping the moderately volatile trending stretches a trend follower needs. Switching the filter off entirely lost 17R in April alone.")
+
+// Prop Firm Rules
+
+groupProp = "PROP FIRM RULES (FTMO)"
+
+propRules = input.bool(true, "Enforce Loss Limits", group = groupProp, tooltip = "Hard limits measured like FTMO: from the initial balance, with the day starting at midnight Prague time and open losses counted. A new trade is only opened when its full risk still fits under both limits, and everything is closed if a limit is reached. Set below the firm's own limits so slippage and gaps have room.")
+
+dailyLimitPct = input.float(4.0, "Daily Loss Limit (%)", minval = 0.5, maxval = 20, step = 0.5, group = groupProp, tooltip = "FTMO's daily limit is 5% of the initial balance. 4% leaves 1% for slippage and gaps.")
+
+totalLimitPct = input.float(8.0, "Max Loss Limit (%)", minval = 1, maxval = 50, step = 0.5, group = groupProp, tooltip = "FTMO's maximum loss is 10% of the initial balance. 8% leaves room for slippage and gaps. Reaching it stops all trading, so the account can never breach the firm's limit.")
+
+profitTargetPct = input.float(10, "Profit Target (%)", minval = 0, maxval = 100, step = 0.5, group = groupProp, tooltip = "FTMO Challenge: 10%, Verification: 5%. Once the account is this far above the initial balance and the minimum trading days are met, any open trade is closed and nothing new is opened, so the pass cannot be given back. 0 = off.")
+
+minTradingDays = input.int(4, "Min Trading Days", minval = 0, maxval = 30, group = groupProp, tooltip = "FTMO requires trades on at least 4 separate days. A day counts when a trade is opened on it (midnight Prague). If the target is reached earlier, trading continues at Risk After Target until the days are met.")
+
+postTargetRisk = input.float(0.1, "Risk After Target (%)", minval = 0.01, maxval = 5, step = 0.05, group = groupProp, tooltip = "Risk per trade once the profit target is reached but the minimum trading days are not met yet. Kept tiny: these trades only exist to count the days.")
+
+challengeStart = input.time(timestamp("2020-01-01T00:00:00"), "Challenge Start", group = groupProp, tooltip = "No trade is opened before this date, so a challenge can be replayed from any day: the limits and the target are measured from the balance on this date. Leave it in the past to trade the whole history.")
+
+flatBeforeClose = input.bool(true, "Flat Before Daily And Weekend Close", group = groupProp, tooltip = "Closes any open trade at 16:45 New York time, before gold's 17:00 daily and weekend close, and opens nothing until the 18:00 reopen. Nothing is held over the break or the weekend.")
+
+newsFilter = input.bool(true, "Flat Around High-Impact News", group = groupProp, tooltip = "Closes any open trade before each event in the list below and opens nothing until after it, so no order - including a stop - can fill inside the firm's news window.")
+
+newsBeforeMin = input.int(20, "Flat Minutes Before News", minval = 17, maxval = 240, group = groupProp, tooltip = "At least 17 on 15m, so the last bar close before the event is at least 2 minutes before it.")
+
+newsAfterMin = input.int(15, "No Entries Minutes After News", minval = 3, maxval = 240, group = groupProp)
+
+newsList = input.text_area("2026-01-09 08:30\n2026-01-13 08:30\n2026-02-11 08:30\n2026-02-13 08:30\n2026-03-06 08:30\n2026-03-11 08:30\n2026-04-03 08:30\n2026-04-10 08:30\n2026-05-08 08:30\n2026-05-12 08:30\n2026-06-05 08:30\n2026-06-10 08:30\n2026-07-02 08:30\n2026-07-14 08:30\n2026-08-07 08:30\n2026-08-12 08:30\n2026-09-04 08:30\n2026-09-11 08:30\n2026-10-02 08:30\n2026-10-14 08:30\n2026-11-06 08:30\n2026-11-10 08:30\n2026-12-04 08:30\n2026-12-10 08:30\n2026-01-28 14:00\n2026-02-18 14:00\n2026-03-18 14:00\n2026-04-08 14:00\n2026-04-29 14:00\n2026-05-20 14:00\n2026-06-17 14:00\n2026-07-08 14:00\n2026-07-29 14:00\n2026-08-19 14:00\n2026-09-16 14:00\n2026-10-28 14:00\n2026-12-09 14:00", "News Events (New York time)", group = groupProp, tooltip = "One event per line as YYYY-MM-DD HH:MM in New York time. Pre-filled with the 2026 US jobs reports and CPI (08:30) and FOMC decisions and minutes (14:00). Add other high-impact events from your firm's calendar here, and next year's dates when they are published.")
+
 
 
 
@@ -2641,13 +2708,15 @@ maxMult = math.min(sensitivity, 26)
 
 
 
-if (autopilotMode == "Short Term")
+// The option strings are "Short-Term" / "Mid-Term"; these tests read "Short Term" /
+// "Mid Term", so those two settings silently did nothing.
+if (autopilotMode == "Short-Term")
 
     minMult:=1
 
     maxMult := 4
 
-if (autopilotMode == 'Mid Term')
+if (autopilotMode == 'Mid-Term')
 
     minMult := 5
 
@@ -2685,7 +2754,15 @@ fromCluster = 'Best'
 
 maxIter = 250
 
-maxData = 2500
+// Signals are only calculated on this many of the most recent bars, so it is also how
+
+// far back the Strategy Tester can go. It was 2500 - about 5 weeks of 15m. A longer
+
+// history leaves the recent signals unchanged; lower it if TradingView reports the
+
+// script taking too long.
+
+maxData = input.int(20000, "Backtest History (bars)", minval = 500, maxval = 50000, step = 500, group = groupStrategy, tooltip = "How many of the most recent bars get signals, and therefore how far back the Strategy Tester reaches. The original script used 2500 (about 5 weeks on 15m). More history does not change the recent signals.")
 
 
 
@@ -3157,11 +3234,15 @@ buySignal  = showSignals and os > os[1] and signalPassesFilter and (signalPreset
 
 sellSignal = showSignals and os < os[1] and signalPassesFilter and (signalPresets != "Smart Trail [Filter]" or smartTrailDirection == 'short') and (signalPresets != "Trend Tracer [Filter]" or trendTracerDirection!=#02ff65) and (signalPresets != "Trend Strength [Filter]" or trendStrengthMetric >= 25)and (signalPresets != "Trend Catcher [Filter]" or newTrendCatcherColor != #02ff65) and (signalPresets != "Neo Cloud [Filter]" or int(lastNeo) <=last5Neo)
 
+// Computed on every bar: ta.atr() called only inside the signal blocks below only saw
+// the signal bars, so its value (and the label offset) was wrong.
+labelAtr = ta.atr(30)
+
 if buySignal
 
     int signalStrength = int(perf_idx*10) < 2 ? 1 : int(perf_idx*10) < 4 ? 2 : int(perf_idx*10) < 5 ? 3 : 4
 
-    label.new(n, low-ta.atr(30)/2, signalClassifier ? str.tostring(signalStrength) : ema50 > ema200 ? "▲+" : "▲"
+    label.new(n, low-labelAtr/2, signalClassifier ? str.tostring(signalStrength) : ema50 > ema200 ? "▲+" : "▲"
 
       , color = bullCss
 
@@ -3183,7 +3264,7 @@ if sellSignal
 
     int signalStrength = int(perf_idx*10) < 2 ? 1 : int(perf_idx*10) < 4 ? 2 : int(perf_idx*10) < 5 ? 3 : 4
 
-    label.new(n, high+ta.atr(30)/2, signalClassifier ? str.tostring(signalStrength) : ema50 < ema200 ? "▼+" : "▼"
+    label.new(n, high+labelAtr/2, signalClassifier ? str.tostring(signalStrength) : ema50 < ema200 ? "▼+" : "▼"
 
       , color = bearCss
 
@@ -3259,22 +3340,6 @@ touchedLowerInner = low  <= loband1
 
 
 
-// Further reversal events, all already computed elsewhere in this script. These are
-
-// what give the warning its coverage: the reversal zone alone is reached by only a
-
-// fraction of trades, whereas a trail or trend flip happens on most of them. This is
-
-// why no distance or time rule is needed - the reversals themselves carry it.
-
-trailTurnedBear   = tpUseTrailFlip and smartTrailDirection == 'short' and smartTrailDirection[1] == 'long'
-
-trailTurnedBull   = tpUseTrailFlip and smartTrailDirection == 'long'  and smartTrailDirection[1] == 'short'
-
-catcherTurnedBear = tpUseTrailFlip and newTrendCatcherColor != #02ff65 and newTrendCatcherColor[1] == #02ff65
-
-catcherTurnedBull = tpUseTrailFlip and newTrendCatcherColor == #02ff65 and newTrendCatcherColor[1] != #02ff65
-
 
 
 // Momentum rolling back through its own zero line - a reversal in the oscillator
@@ -3289,7 +3354,7 @@ oscTurnedBull = normalBullishMedianCross
 
 // Early  - any single reversal hint, including the inner band and a bare cross.
 
-// Normal - a real reversal event: the zone, a reversal wave, a trail/catcher flip,
+// Normal - a real reversal event: the zone, a reversal wave,
 
 //          or momentum crossing back through zero.
 
@@ -3297,21 +3362,21 @@ oscTurnedBull = normalBullishMedianCross
 
 bearishExhaustion = switch tpWarnSensitivity
 
-    "Early" => touchedUpperInner or inUpperZone or bearishCross or isBearishTriggerWave or trailTurnedBear or catcherTurnedBear or oscTurnedBear
+    "Early" => touchedUpperInner or inUpperZone or bearishCross or isBearishTriggerWave or oscTurnedBear
 
     "Late"  => inUpperZone and isBearishTriggerWave
 
-    => inUpperZone or isBearishTriggerWave or trailTurnedBear or catcherTurnedBear or oscTurnedBear
+    => inUpperZone or isBearishTriggerWave or oscTurnedBear
 
 
 
 bullishExhaustion = switch tpWarnSensitivity
 
-    "Early" => touchedLowerInner or inLowerZone or bullishCross or isBullishTriggerWave or trailTurnedBull or catcherTurnedBull or oscTurnedBull
+    "Early" => touchedLowerInner or inLowerZone or bullishCross or isBullishTriggerWave or oscTurnedBull
 
     "Late"  => inLowerZone and isBullishTriggerWave
 
-    => inLowerZone or isBullishTriggerWave or trailTurnedBull or catcherTurnedBull or oscTurnedBull
+    => inLowerZone or isBullishTriggerWave or oscTurnedBull
 
 
 
@@ -3365,33 +3430,53 @@ if openProfitAtr > peakProfitAtr
 
 
 
-// The strategy trades exactly the signals printed above, one trade per signal, and
+// The strategy trades exactly the signals printed above, one trade per signal. Every
 
-// every trade ends with one exit label. The old warning only fired when a one-bar
+// rule below is measured in R, the distance from the entry to the initial stop, so it
 
-// reversal event happened to land on a bar where the leg was also in profit, and its
+// means the same thing on a quiet and a wild day. The exits were chosen by replaying
 
-// fallback only when the leg was still in profit at the next signal, so a large share
+// Feb - Sep 2026 XAUUSD 15m, choosing on Feb - May and checking on Jun - Sep. The
 
-// of signals ended with no label at all. A trade is now closed by the first of:
+// profit comes from a few large winners, so the exits are built to keep them: a stop
 
-//   1. the TP/SL points, when switched on (filled inside the bar, read back below)
+// no wider than Max Stop Distance ATR (the trailing line alone averages ~2.5 ATR and
 
-//   2. the take profit warning - the yellow label is now a real exit order
+// let losers run), and a take profit that waits until the trade is 2R up instead of
 
-//   3. the profit lock - the trade ran into profit and has given half of it back
+// banking a few points on the first reversal hint. Entry filters (higher timeframe
+
+// trend, chop, quality, volatility) were tested too and none held up out of sample.
+
+// A trade is closed by the first of:
+
+//   1. its stop: the trailing line at entry capped at Max Stop Distance ATR, or the
+
+//      TP/SL points when those are On; optionally moved to breakeven at Breakeven At R
+
+//   2. the take profit warning (yellow) once the trade is at least Take Profit Min R up
+
+//   3. the profit lock, when switched on: after Profit Lock Start R, giving back Profit
+
+//      Lock Give Back % of the best run
 
 //   4. the trailing stop behind the signals flipping against the trade: an opposite
 
 //      signal (the trade is reversed), or one the fakeout filter suppressed
 
-// Exits in profit print the yellow TAKE PROFIT label, exits at a loss a grey EXIT.
+// Exit labels are drawn from the strategy's own fills, so every label is an exit the
+
+// Strategy Tester recorded, at the price it recorded.
 
 
 
 var int   tradeDir   = 0
 
 var float tradeEntry = na
+
+var float tradeRisk  = na
+
+var float tradeQty   = na
 
 var int   tradeBar   = na
 
@@ -3419,51 +3504,93 @@ tpslUnit = ta.atr(10) * atrMultiplier * takeProfitStopLossDistance / 5
 
 
 
-// TP/SL orders fill inside the bar, so those exits are read back from the trade list
+// Labels for every exit the broker emulator filled since the last bar. Orders sent at a
 
-// rather than predicted. Both halves share one stop, so a stop out closes two trade
+// bar's close fill on that close, so they are read back here on the next bar and drawn
 
-// records on the same bar - only one label is drawn for it.
+// on the bar they filled on. Two halves of one position closing together share a label.
 
 if strategy.closedtrades > seenClosed
 
-    int    lastBar = na
-
-    string lastTag = na
+    int lastBar = na
 
     for i = seenClosed to strategy.closedtrades - 1
 
-        string exitTag = strategy.closedtrades.exit_comment(i)
+        int exitBar = strategy.closedtrades.exit_bar_index(i)
 
-        int    exitBar = strategy.closedtrades.exit_bar_index(i)
+        if exitBar != lastBar
 
-        if (exitTag == "TP1" or exitTag == "TP2" or exitTag == "SL") and not (exitBar == lastBar and exitTag == lastTag)
+            string why = strategy.closedtrades.exit_comment(i)
 
-            bool wasLong  = strategy.closedtrades.size(i) > 0
+            why := why == "Buy" or why == "Sell" ? "Signal Flip" : why
 
-            bool isTarget = exitTag != "SL"
+            bool  wasLong = strategy.closedtrades.size(i) > 0
 
-            label.new(exitBar, strategy.closedtrades.exit_price(i), isTarget ? "⚠ TAKE PROFIT (" + exitTag + ")" : "✕ STOP LOSS"
+            bool  won     = strategy.closedtrades.profit(i) > 0
 
-              , color = isTarget ? #ffb300 : #f23645
+            float px      = strategy.closedtrades.exit_price(i)
 
-              , style = wasLong == isTarget ? label.style_label_down : label.style_label_up
+            label.new(exitBar, px, won ? "⚠ TAKE PROFIT" : why == "SL" ? "✕ STOP LOSS" : "✕ EXIT"
 
-              , textcolor = isTarget ? #000000 : #ffffff
+              , color = won ? #ffb300 : why == "SL" ? #f23645 : #787b86
+
+              , style = wasLong == won ? label.style_label_down : label.style_label_up
+
+              , textcolor = won ? #000000 : #ffffff
 
               , yloc = yloc.price
 
-              , size = size.normal)
+              , size = size.normal
+
+              , tooltip = why + ": " + (wasLong ? "long" : "short") + " from " + str.tostring(strategy.closedtrades.entry_price(i), format.mintick) + " closed at " + str.tostring(px, format.mintick))
 
             lastBar := exitBar
-
-            lastTag := exitTag
 
     seenClosed := strategy.closedtrades
 
 
 
-// The TP/SL orders closed the whole position.
+// A pullback limit order waiting to fill.
+
+var int   pendDir  = 0
+
+var int   pendBar  = na
+
+var float pendStop = na
+
+var float pendQty  = na
+
+
+
+// The limit order filled inside the bar: the trade starts here, from its fill price.
+
+if pendDir != 0 and (pendDir == 1 ? strategy.position_size > 0 : strategy.position_size < 0)
+
+    tradeDir   := pendDir
+
+    tradeEntry := strategy.position_avg_price
+
+    tradeRisk  := math.abs(tradeEntry - pendStop)
+
+    tradeQty   := pendQty
+
+    tradeBar   := bar_index
+
+    tradeBest  := close
+
+    tradeSL    := pendStop
+
+    pendDir    := 0
+
+
+
+// It filled and was stopped out within the same bar.
+
+if pendDir != 0 and strategy.position_size == 0 and strategy.closedtrades > 0 and strategy.closedtrades.entry_bar_index(strategy.closedtrades - 1) > pendBar
+
+    pendDir := 0
+
+// The stop or TP/SL orders closed the whole position inside the bar.
 
 if tradeDir != 0 and bar_index > tradeBar and strategy.position_size == 0
 
@@ -3483,27 +3610,37 @@ if tradeDir == -1
 
 
 
-float openRun = tradeDir == 1 ? close - tradeEntry : tradeDir == -1 ? tradeEntry - close : 0.0
+float runR  = tradeDir == 0 ? 0.0 : (close - tradeEntry) * tradeDir / tradeRisk
 
-float bestRun = tradeDir == 1 ? tradeBest - tradeEntry : tradeDir == -1 ? tradeEntry - tradeBest : 0.0
-
-
-
-// Take profit warning: the same reversal events, sensitivity and profit setting as
-
-// before, now tested against the open trade on every bar instead of once per leg.
-
-tpWarnHit = showTakeProfitWarning and tradeDir != 0 and bar_index > tradeBar and (tradeDir == 1 ? bearishExhaustion : bullishExhaustion) and (not tpWarnOnlyInProfit or openRun > 0)
+float bestR = tradeDir == 0 ? 0.0 : (tradeBest - tradeEntry) * tradeDir / tradeRisk
 
 
 
-// Profit lock: the reversal events are one-bar events and can all land on bars where
+// Take profit warning: the same reversal events and sensitivity as before, but only
 
-// the trade is offside. Once a trade has run Profit Lock ATR in its favour, giving back
+// acted on once the trade is Take Profit Min R up. At "any profit" it fired on the
 
-// half of that run is the reversal, and the profit is banked before it turns into a loss.
+// first reversal hint a few points into the trade and cut off every trend.
 
-profitLockHit = profitLockAtr > 0 and tradeDir != 0 and bar_index > tradeBar and bestRun >= profitLockAtr * atr and openRun <= bestRun * 0.5
+tpWarnHit = showTakeProfitWarning and tradeDir != 0 and bar_index > tradeBar and (tradeDir == 1 ? bearishExhaustion : bullishExhaustion) and (tpWarnOnlyInProfit ? runR >= math.max(tpMinR, 0.0001) : true)
+
+
+
+// Profit lock: once a trade has run Profit Lock Start R, handing back Give Back % of
+
+// that run is treated as the turn and the rest is banked.
+
+profitLockHit = profitLockMode == "On Close" and profitLockR > 0 and tradeDir != 0 and bar_index > tradeBar and bestR >= profitLockR and runR <= bestR * (1 - profitLockGiveBack / 100)
+
+// Best price reached since entry, from highs and lows, for the trailing profit lock.
+// The entry bar itself is left out: its range includes prices from before the fill.
+var float tradeExt = na
+var int   extBar   = na
+if nz(tradeBar, -1) != nz(extBar, -1)
+    tradeExt := na
+    extBar   := tradeBar
+if tradeDir != 0 and bar_index > tradeBar
+    tradeExt := tradeDir == 1 ? math.max(nz(tradeExt, close), high) : math.min(nz(tradeExt, close), low)
 
 
 
@@ -3513,37 +3650,184 @@ flipAgainst = tradeDir == 1 ? (sellSignal or (exitOnFilteredFlip and os < os[1])
 
 
 
-exitReason = tpWarnHit ? "Take Profit Warning" : profitLockHit ? "Profit Lock" : flipAgainst ? "Signal Flip" : ""
+// Position size for a fixed % risk. Without TP/SL points the stop is the trailing stop
+
+// line at entry - the level whose break flips the signal - capped at Max Stop Distance
+
+// ATR. A hard stop order sits there.
+
+float entryStopDist = useTPSL ? tpslUnit : maxStopAtr > 0 ? math.min(math.abs(close - ts), maxStopAtr * atr) : math.abs(close - ts)
+
+entryStopDist := na(entryStopDist) or entryStopDist <= 0 ? atr : entryStopDist
+
+
+
+// # ============================[PROP FIRM RULES]============================ #
+
+
+
+// News events, parsed once from the input list.
+
+var array<int> newsTimes = array.new<int>()
+
+if barstate.isfirst
+
+    for ln in str.split(newsList, "\n")
+
+        array<string> tok = array.new<string>()
+
+        for w in str.split(ln, " ")
+
+            if str.length(w) > 0
+
+                tok.push(w)
+
+        if tok.size() >= 2
+
+            array<string> dt = str.split(tok.get(0), "-")
+
+            array<string> hm = str.split(tok.get(1), ":")
+
+            if dt.size() == 3 and hm.size() == 2
+
+                float yy = str.tonumber(dt.get(0))
+
+                float mo = str.tonumber(dt.get(1))
+
+                float dd = str.tonumber(dt.get(2))
+
+                float hh = str.tonumber(hm.get(0))
+
+                float mi = str.tonumber(hm.get(1))
+
+                if not (na(yy) or na(mo) or na(dd) or na(hh) or na(mi))
+
+                    newsTimes.push(timestamp("America/New_York", int(yy), int(mo), int(dd), int(hh), int(mi)))
+
+
+
+// Decisions are taken at the bar close and fill on it, so the tests use the close time.
+
+bool nearNews = false
+
+if newsFilter
+
+    for e in newsTimes
+
+        if e - time_close <= newsBeforeMin * 60000 and time_close - e <= newsAfterMin * 60000
+
+            nearNews := true
+
+
+
+int nyMinute = hour(time_close, "America/New_York") * 60 + minute(time_close, "America/New_York")
+
+bool nearClose = flatBeforeClose and nyMinute >= 16 * 60 + 45 and nyMinute < 18 * 60
+
+
+
+// FTMO counts from the initial balance and resets the day at midnight Prague time; the
+
+// day starts from the higher of balance and equity, and open losses count.
+
+// The reference is taken from the previous bar - the state at midnight - rather than
+// from the first bar of the new day, whose own move would otherwise be baked in.
+var float dayStartEquity = strategy.initial_capital
+
+if ta.change(dayofmonth(time_close, "Europe/Prague")) != 0
+
+    dayStartEquity := math.max(nz(strategy.equity[1], strategy.initial_capital), strategy.initial_capital + nz(strategy.netprofit[1]))
+
+float dayLossPct   = (dayStartEquity - strategy.equity) / strategy.initial_capital * 100
+
+float totalLossPct = (strategy.initial_capital - strategy.equity) / strategy.initial_capital * 100
+
+bool  limitHit     = propRules and (dayLossPct >= dailyLimitPct or totalLossPct >= totalLimitPct)
+
+// Trading days, as FTMO counts them: separate days (midnight Prague) on which a trade
+// was opened. A market order sent at a close fills there and is seen on the next bar.
+var int tradesSeen   = 0
+var int tradingDays  = 0
+var int lastTradeDay = na
+int pragueDay = year(time_close, "Europe/Prague") * 10000 + month(time_close, "Europe/Prague") * 100 + dayofmonth(time_close, "Europe/Prague")
+if strategy.closedtrades + strategy.opentrades > tradesSeen
+    // Tested with na() first: comparing against na yields na (false), not true.
+    if na(lastTradeDay) or pragueDay != lastTradeDay
+        tradingDays  += 1
+        lastTradeDay := pragueDay
+    tradesSeen := strategy.closedtrades + strategy.opentrades
+
+// Profit target. Once it is reached with the minimum trading days met the challenge is
+// passed: the open trade is closed and nothing new is opened, so it cannot be given back.
+float gainPct  = -totalLossPct
+bool targetHit = propRules and profitTargetPct > 0 and gainPct >= profitTargetPct
+var bool passed = false
+if targetHit and tradingDays >= minTradingDays
+    passed := true
+
+// Risk per trade, in % of the initial balance - the base every FTMO limit is measured on.
+// Drawdown Scaled risks a fixed share of the room left before the max loss limit, so
+// the size shrinks after losses and grows after gains without any manual input.
+float roomPct = totalLimitPct - totalLossPct
+float riskNow = riskMode == "Fixed" ? riskPercent : math.max(math.min(maxRiskPct, roomPct / riskDivisor), minRiskPct)
+if targetHit
+    riskNow := math.min(riskNow, postTargetRisk)
+
+// TradingView rounds a CFD order down to whole units and skips anything that rounds to
+// 0, so the size never goes below 1 unit. On a feed where 1 unit is 100 oz ($100 a
+// point) a small account cannot reach 1 unit at 1% risk; the risk actually taken is
+// shown on the dashboard.
+float riskQty      = math.max(math.floor(strategy.initial_capital * riskNow / 100 / (entryStopDist * syminfo.pointvalue)), 1)
+float riskTakenPct = riskQty * entryStopDist * syminfo.pointvalue / strategy.initial_capital * 100
+
+// A new trade must fit under both limits even if it is stopped out in full.
+
+float newTradeRiskPct = riskTakenPct
+
+bool  riskFits = not propRules or (dayLossPct + newTradeRiskPct <= dailyLimitPct and totalLossPct + newTradeRiskPct <= totalLimitPct)
+
+// Signals in the quiet Tokyo hours or around the US data and New York open are not
+// traded when those filters are on.
+
+inTradeSession = (not useSession or na(time(timeframe.period, "0200-0700", "UTC"))) and (not skipUsOpen or na(time(timeframe.period, usOpenWindow, "America/New_York"))) and time >= challengeStart
+
+// Volatility from closes only: the average close-to-close move over 20 bars, ranked
+
+// against the last 500 bars. ATR was tried first but it is built from highs and lows,
+
+// and a broker's spread spikes around the daily rollover inflate the wicks - on OANDA
+
+// that pushed the Tokyo-open hours above the band and threw away the best trades.
+
+// Closes are not affected by those wicks. Allowed through while the rank warms up.
+
+float closeVol = ta.rma(math.abs(ta.change(close)), 20)
+
+float volPct   = ta.percentrank(closeVol, 500)
+
+bool  volOk    = not volFilter or na(volPct) or (volPct >= volMinPct and volPct < volMaxPct)
+
+// Higher timeframe trend, from its last closed bar only ([1] with lookahead on is the
+// standard non-repainting form).
+[htfClose, htfEma] = request.security(syminfo.tickerid, htfTf, [close[1], ta.ema(close, 50)[1]], lookahead = barmerge.lookahead_on)
+bool htfLongOk  = not htfFilter or htfClose > htfEma
+bool htfShortOk = not htfFilter or htfClose < htfEma
+
+canEnter = inTradeSession and volOk and not nearNews and not nearClose and not limitHit and not passed and riskFits
+
+// Pullback entry, used whenever the stop leaves room for it; otherwise enter at the close.
+
+bool usePull = entryPullbackAtr > 0 and not useTPSL and entryStopDist > (entryPullbackAtr + 0.5) * atr
+
+exitReason = limitHit ? "Loss Limit" : passed ? "Target Reached" : tpWarnHit ? "TP Warning" : nearNews ? "News" : nearClose ? "Market Close" : profitLockHit ? "Profit Lock" : flipAgainst ? "Signal Flip" : ""
 
 
 
 if tradeDir != 0 and exitReason != ""
 
-    bool exitLong     = tradeDir == 1
+    bool exitLong  = tradeDir == 1
 
-    bool exitInProfit = openRun > 0
-
-    bool reversing    = exitLong ? sellSignal : buySignal
-
-    // An opposite signal on this bar already sits on the usual side of the candle,
-
-    // so the exit label moves to the other side instead of covering it.
-
-    bool labelAbove   = exitLong ? not reversing : reversing
-
-    label.new(n, close, exitInProfit ? "⚠ TAKE PROFIT" : "✕ EXIT"
-
-      , color = exitInProfit ? #ffb300 : #787b86
-
-      , style = labelAbove ? label.style_label_down : label.style_label_up
-
-      , textcolor = exitInProfit ? #000000 : #ffffff
-
-      , yloc = labelAbove ? yloc.abovebar : yloc.belowbar
-
-      , size = size.normal
-
-      , tooltip = exitReason + ": " + (exitLong ? "long" : "short") + " from " + str.tostring(tradeEntry, format.mintick) + " closed at " + str.tostring(close, format.mintick))
+    bool reversing = (exitLong ? sellSignal and htfShortOk : buySignal and htfLongOk) and canEnter and not usePull
 
     // On a reversal the opposite entry below closes this trade itself. Closing it here
 
@@ -3553,61 +3837,184 @@ if tradeDir != 0 and exitReason != ""
 
         strategy.close(exitLong ? "Long" : "Short", comment = exitReason)
 
-    alert((exitInProfit ? "Take profit: " : "Exit: ") + "close your " + (exitLong ? "long" : "short") + " (" + exitReason + ")", alert.freq_once_per_bar_close)
+    alert((runR > 0 ? "Take profit: " : "Exit: ") + "close your " + (exitLong ? "long" : "short") + " (" + exitReason + ")", alert.freq_once_per_bar_close)
 
     tradeDir := 0
 
 
 
-if buySignal and tradeDir != 1
+// Breakeven: once the trade has run Breakeven At R, the stop moves to the entry.
 
-    strategy.entry("Long", strategy.long, comment = "Buy")
+if tradeDir != 0 and breakevenR > 0 and bestR >= breakevenR and (tradeDir == 1 ? tradeSL < tradeEntry : tradeSL > tradeEntry)
 
-    tradeDir   := 1
+    tradeSL := tradeEntry
 
-    tradeEntry := close
+    string entryId = tradeDir == 1 ? "Long" : "Short"
 
-    tradeBar   := bar_index
-
-    tradeBest  := close
-
-    tradeSL    := close - tpslUnit
-
-    tradeTP1   := close + tpslUnit
-
-    tradeTP2   := close + 2 * tpslUnit
+    string pfx     = tradeDir == 1 ? "L " : "S "
 
     if useTPSL
 
-        strategy.exit("L TP1", "Long", qty_percent = 50, limit = tradeTP1, stop = tradeSL, comment_profit = "TP1", comment_loss = "SL")
+        // TP1 is only still working while the full position is open.
 
-        strategy.exit("L TP2", "Long", limit = tradeTP2, stop = tradeSL, comment_profit = "TP2", comment_loss = "SL")
+        if math.abs(strategy.position_size) >= tradeQty
+
+            strategy.exit(pfx + "TP1", entryId, qty_percent = 50, limit = tradeTP1, stop = tradeSL, comment_profit = "TP1", comment_loss = "Breakeven")
+
+        strategy.exit(pfx + "TP2", entryId, limit = tradeTP2, stop = tradeSL, comment_profit = "TP2", comment_loss = "Breakeven")
+
+    else
+
+        strategy.exit(pfx + "SL", entryId, stop = tradeSL, comment = "Breakeven")
+
+// Trailing profit lock: after Profit Lock Start R the stop order trails at Give Back %
+// of the best price reached, so it fills inside the bar instead of waiting for a close.
+// Set at this bar's close, it only works from the next bar on.
+if tradeDir != 0 and profitLockMode == "Trailing Stop" and profitLockR > 0 and not useTPSL and not na(tradeExt)
+    float extR = (tradeExt - tradeEntry) * tradeDir / tradeRisk
+    if extR >= profitLockR
+        float lockPx = tradeEntry + (tradeExt - tradeEntry) * (1 - profitLockGiveBack / 100)
+        if tradeDir == 1 ? lockPx > tradeSL : lockPx < tradeSL
+            tradeSL := lockPx
+            strategy.exit(tradeDir == 1 ? "L SL" : "S SL", tradeDir == 1 ? "Long" : "Short", stop = tradeSL, comment = "Profit Lock")
 
 
 
-if sellSignal and tradeDir != -1
+// A waiting pullback order is cancelled when it expires, before news or the daily
 
-    strategy.entry("Short", strategy.short, comment = "Sell")
+// close (so nothing can fill inside those windows), at a loss limit or the profit
+// target, or when the trailing stop flips against it - including a flip the fakeout
+// filter suppressed, which used to leave the order working against the new trend.
 
-    tradeDir   := -1
+if pendDir != 0 and (bar_index >= pendBar + pullbackBars or nearNews or nearClose or limitHit or passed or (pendDir == 1 ? os < os[1] : os > os[1]))
 
-    tradeEntry := close
+    strategy.cancel(pendDir == 1 ? "Long" : "Short")
 
-    tradeBar   := bar_index
+    pendDir := 0
 
-    tradeBest  := close
 
-    tradeSL    := close + tpslUnit
 
-    tradeTP1   := close - tpslUnit
+exportTrades = input.bool(false, "Export Trade List", group = groupStrategy, tooltip = "Lists every closed trade as CSV in a table at the bottom left, including its result in R. For offline analysis only.")
 
-    tradeTP2   := close - 2 * tpslUnit
+// Stop price of every order sent, by bar, so the export can express each trade in R.
+var array<int>   stopBars   = array.new<int>()
+var array<float> stopPrices = array.new<float>()
 
-    if useTPSL
+if buySignal and tradeDir != 1 and canEnter and htfLongOk
 
-        strategy.exit("S TP1", "Short", qty_percent = 50, limit = tradeTP1, stop = tradeSL, comment_profit = "TP1", comment_loss = "SL")
+    stopBars.push(bar_index)
+    stopPrices.push(close - entryStopDist)
 
-        strategy.exit("S TP2", "Short", limit = tradeTP2, stop = tradeSL, comment_profit = "TP2", comment_loss = "SL")
+    if usePull
+
+        float lim = close - entryPullbackAtr * atr
+
+        float stp = close - entryStopDist
+
+        float q   = math.max(math.floor(strategy.initial_capital * riskNow / 100 / ((lim - stp) * syminfo.pointvalue)), 1)
+
+        strategy.entry("Long", strategy.long, qty = q, limit = lim, comment = "Buy")
+
+        strategy.exit("L SL", "Long", stop = stp, comment = "SL")
+
+        pendDir  := 1
+
+        pendBar  := bar_index
+
+        pendStop := stp
+
+        pendQty  := q
+
+    else
+
+        strategy.entry("Long", strategy.long, qty = riskQty, comment = "Buy")
+
+        tradeDir   := 1
+
+        tradeEntry := close
+
+        tradeRisk  := entryStopDist
+
+        tradeQty   := riskQty
+
+        tradeBar   := bar_index
+
+        tradeBest  := close
+
+        tradeSL    := close - entryStopDist
+
+        tradeTP1   := close + tpslUnit
+
+        tradeTP2   := close + 2 * tpslUnit
+
+        if useTPSL
+
+            strategy.exit("L TP1", "Long", qty_percent = 50, limit = tradeTP1, stop = tradeSL, comment_profit = "TP1", comment_loss = "SL")
+
+            strategy.exit("L TP2", "Long", limit = tradeTP2, stop = tradeSL, comment_profit = "TP2", comment_loss = "SL")
+
+        else
+
+            strategy.exit("L SL", "Long", stop = tradeSL, comment = "SL")
+
+
+
+if sellSignal and tradeDir != -1 and canEnter and htfShortOk
+
+    stopBars.push(bar_index)
+    stopPrices.push(close + entryStopDist)
+
+    if usePull
+
+        float lim = close + entryPullbackAtr * atr
+
+        float stp = close + entryStopDist
+
+        float q   = math.max(math.floor(strategy.initial_capital * riskNow / 100 / ((stp - lim) * syminfo.pointvalue)), 1)
+
+        strategy.entry("Short", strategy.short, qty = q, limit = lim, comment = "Sell")
+
+        strategy.exit("S SL", "Short", stop = stp, comment = "SL")
+
+        pendDir  := -1
+
+        pendBar  := bar_index
+
+        pendStop := stp
+
+        pendQty  := q
+
+    else
+
+        strategy.entry("Short", strategy.short, qty = riskQty, comment = "Sell")
+
+        tradeDir   := -1
+
+        tradeEntry := close
+
+        tradeRisk  := entryStopDist
+
+        tradeQty   := riskQty
+
+        tradeBar   := bar_index
+
+        tradeBest  := close
+
+        tradeSL    := close + entryStopDist
+
+        tradeTP1   := close - tpslUnit
+
+        tradeTP2   := close - 2 * tpslUnit
+
+        if useTPSL
+
+            strategy.exit("S TP1", "Short", qty_percent = 50, limit = tradeTP1, stop = tradeSL, comment_profit = "TP1", comment_loss = "SL")
+
+            strategy.exit("S TP2", "Short", limit = tradeTP2, stop = tradeSL, comment_profit = "TP2", comment_loss = "SL")
+
+        else
+
+            strategy.exit("S SL", "Short", stop = tradeSL, comment = "SL")
 
 
 
@@ -3713,13 +4120,13 @@ plotchar(isBullishTriggerWave and position == -1, "Long", "✖", location.belowb
 
 // placed an order.
 
-showLevels = useTPSL and tradeDir != 0 and bar_index > tradeBar
+showLevels = tradeDir != 0 and bar_index > tradeBar
 
 entryPlot  = plot(showLevels ? tradeEntry : na, "Trade Entry", color.new(#787b86, 0), 1, plot.style_linebr, editable = false)
 
-tp1Plot    = plot(showLevels ? tradeTP1   : na, "TP1",         color.new(#3666f5, 0), 2, plot.style_linebr, editable = false)
+tp1Plot    = plot(showLevels and useTPSL ? tradeTP1 : na, "TP1",         color.new(#3666f5, 0), 2, plot.style_linebr, editable = false)
 
-tp2Plot    = plot(showLevels ? tradeTP2   : na, "TP2",         color.new(#3666f5, 0), 2, plot.style_linebr, editable = false)
+tp2Plot    = plot(showLevels and useTPSL ? tradeTP2 : na, "TP2",         color.new(#3666f5, 0), 2, plot.style_linebr, editable = false)
 
 slPlot     = plot(showLevels ? tradeSL    : na, "Stop Loss",   color.new(color.red, 0), 2, plot.style_linebr, editable = false)
 
@@ -3727,3 +4134,91 @@ fill(entryPlot, tp2Plot, color.new(#3666f5, 85), editable = false)
 
 fill(entryPlot, slPlot, color.new(color.red, 85), editable = false)
 
+// Signals printed vs trades taken, so a symbol the orders cannot fill on is obvious.
+
+var int signalCount = 0
+
+var float lastRiskPct = na
+
+var float lastRiskWanted = na
+
+
+
+if buySignal or sellSignal
+
+    signalCount += 1
+
+    lastRiskPct := riskTakenPct
+
+    lastRiskWanted := riskNow
+
+
+
+if showDashboard and barstate.islast
+
+    tb.cell(0, 0, "📊 Signals / Trades", text_color = color.white, text_size = table_size, text_halign = text.align_left)
+
+    tb.cell(1, 0, str.tostring(signalCount) + " / " + str.tostring(strategy.closedtrades + strategy.opentrades), text_color = color.white, text_size = table_size)
+
+    tb.cell(2, 0, na(lastRiskPct) ? "" : "Risk " + str.tostring(lastRiskPct, "#.##") + "%", text_color = lastRiskPct > lastRiskWanted * 1.5 ? dashboardRedText : dashboardGreenText, text_size = table_size, tooltip = "Risk taken on the last signal, in % of the initial balance. Well above the risk setting means the account is too small for 1 contract at that risk - raise Initial capital in Properties.")
+
+    tb.cell(2, 1, "Day " + str.tostring(-dayLossPct, "#.##") + "% / -" + str.tostring(dailyLimitPct, "#.#") + "%", text_color = dayLossPct > dailyLimitPct * 0.75 ? dashboardRedText : dashboardGreenText, text_size = table_size, tooltip = "Today's result (midnight Prague) against the daily loss limit, measured from the initial balance.")
+
+    tb.cell(2, 2, "Total " + str.tostring(-totalLossPct, "#.##") + "% / -" + str.tostring(totalLimitPct, "#.#") + "%", text_color = totalLossPct > totalLimitPct * 0.75 ? dashboardRedText : dashboardGreenText, text_size = table_size, tooltip = "Result since the start against the max loss limit, measured from the initial balance.")
+
+    tb.cell(2, 3, passed ? "✅ Target reached" : profitTargetPct <= 0 ? "Target off" : "Target " + str.tostring(gainPct, "#.##") + "% / " + str.tostring(profitTargetPct, "#.#") + "%", text_color = passed or targetHit ? dashboardGreenText : color.white, text_size = table_size, tooltip = "Progress to the profit target, from the initial balance. Once reached with the minimum trading days met, trading stops.")
+
+    tb.cell(2, 4, "Days " + str.tostring(tradingDays) + " / " + str.tostring(minTradingDays), text_color = tradingDays >= minTradingDays ? dashboardGreenText : color.white, text_size = table_size, tooltip = "Trading days so far (days a trade was opened, midnight Prague) against the minimum.")
+
+    tb.cell(2, 5, "Next risk " + str.tostring(riskNow, "#.##") + "%", text_color = color.white, text_size = table_size, tooltip = riskMode == "Fixed" ? "Fixed risk per trade." : "Drawdown Scaled: room left before the max loss limit / Losses To Limit, kept between Min and Max Risk.")
+
+    int lastNews = newsTimes.size() > 0 ? newsTimes.max() : na
+    if newsFilter and (na(lastNews) or lastNews < timenow)
+        tb.cell(2, 6, "⚠ News list expired", text_color = dashboardRedText, text_size = table_size, tooltip = "Every event in the news list is in the past, so the news filter is doing nothing. Add the coming high-impact events.")
+
+
+
+// The account risk cannot be met when a single unit of the chart's symbol already risks
+
+// more than it. Said on the chart, because the Strategy Tester silently sizes 1 unit.
+
+var table sizeWarn = table.new(position.top_center, 1, 1, bgcolor = #49343e, frame_color = #f23645, frame_width = 1)
+
+// # ============================[TRADE EXPORT]============================ #
+
+// Lists every closed trade as CSV in a table, with its result in R (profit over the
+// risk at entry), so prop firm pass rates can be replayed offline.
+var table exportTable = na
+if exportTrades and barstate.islast and strategy.closedtrades > 0
+    exportTable := table.new(position.bottom_left, 1, strategy.closedtrades + 1, bgcolor = #1e222d)
+    exportTable.cell(0, 0, "entry_time;exit_time;dir;entry;exit;qty;profit;risk_usd;r;comment", text_color = color.white, text_size = size.tiny)
+    int j = 0
+    for i = 0 to strategy.closedtrades - 1
+        int eb = strategy.closedtrades.entry_bar_index(i)
+        // Pine does not short-circuit here, so the bounds test cannot share the condition.
+        bool advance = true
+        while advance
+            advance := false
+            if j + 1 < stopBars.size()
+                if stopBars.get(j + 1) <= eb
+                    j += 1
+                    advance := true
+        float ep   = strategy.closedtrades.entry_price(i)
+        float sz   = strategy.closedtrades.size(i)
+        float stp  = stopBars.size() > 0 ? stopPrices.get(j) : na
+        float rUsd = math.abs(sz) * math.abs(ep - stp) * syminfo.pointvalue
+        float pnl  = strategy.closedtrades.profit(i)
+        string row = str.format_time(strategy.closedtrades.entry_time(i), "yyyy-MM-dd HH:mm", "UTC") + ";" + str.format_time(strategy.closedtrades.exit_time(i), "yyyy-MM-dd HH:mm", "UTC") + ";" + (sz > 0 ? "L" : "S") + ";" + str.tostring(ep, "0.###") + ";" + str.tostring(strategy.closedtrades.exit_price(i), "0.###") + ";" + str.tostring(math.abs(sz), "0.###") + ";" + str.tostring(pnl, "0.##") + ";" + str.tostring(rUsd, "0.##") + ";" + str.tostring(rUsd > 0 ? pnl / rUsd : na, "0.###") + ";" + strategy.closedtrades.exit_comment(i)
+        exportTable.cell(0, i + 1, row, text_color = color.white, text_size = size.tiny)
+
+if barstate.islast
+
+    float unitRiskPct = entryStopDist * syminfo.pointvalue / strategy.initial_capital * 100
+
+    if unitRiskPct > riskNow * 1.5
+
+        table.cell(sizeWarn, 0, 0, "⚠ 1 unit of " + syminfo.tickerid + " = $" + str.tostring(syminfo.pointvalue, "#.##") + " per point, so the smallest trade risks " + str.tostring(unitRiskPct, "#.#") + "% of the account, not " + str.tostring(riskNow, "#.#") + "%.\nTradingView cannot trade part of a unit. Use a feed where 1 unit = 1 oz (e.g. OANDA:XAUUSD) for " + str.tostring(riskNow, "#.#") + "% risk.", text_color = color.white, text_size = size.normal)
+
+    else
+
+        table.clear(sizeWarn, 0, 0)

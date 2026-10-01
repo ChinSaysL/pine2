@@ -1,0 +1,37 @@
+sessions 1249  2021-09-14 .. 2026-09-30
+
+===== ORB stream (1245 trades) =====
+                                               n    totR    PF   win%  gave_back%  2026R  R minexit
+rule                                                                                               
+live: fixed stop -> 15:55                 1245.0  105.06  1.16  42.73       24.26  -3.52      -1.06
+afternoon: BE at 13:00 if >= +0.5R        1245.0  114.35  1.18  38.39       28.59  -4.79      -1.06
+afternoon: BE at 14:00 if >= +0.5R        1245.0  110.49  1.17  40.32       26.67  -5.18      -1.06
+afternoon BE 13:00 + trail 0.5R at +1.5R  1245.0   69.36  1.12  43.37       23.61  -4.28      -1.06
+afternoon: BE at 13:00 if >= +0.25R       1245.0  110.07  1.18  35.82       31.00  -7.55      -1.06
+
+===== NOISE stream (717 trades) =====
+                                              n   totR    PF   win%  gave_back%  2026R  R minexit
+rule                                                                                             
+live: fixed stop -> 15:55                 717.0  31.27  1.14  39.47       16.04  -2.22      -1.05
+afternoon: BE at 13:00 if >= +0.5R        717.0  33.01  1.15  37.66       17.85  -0.96      -1.05
+afternoon: BE at 14:00 if >= +0.5R        717.0  30.80  1.14  38.08       17.43  -2.05      -1.05
+afternoon BE 13:00 + trail 0.5R at +1.5R  717.0  40.76  1.19  39.61       15.90   5.71      -1.05
+afternoon: BE at 13:00 if >= +0.25R       717.0  32.84  1.15  36.12       18.55  -1.83      -1.05
+
+===== BOTH stream (1962 trades) =====
+                                               n    totR    PF   win%  gave_back%  2026R  R minexit
+rule                                                                                               
+live: fixed stop -> 15:55                 1962.0  136.33  1.15  41.54       21.25  -5.74      -1.06
+afternoon: BE at 13:00 if >= +0.5R        1962.0  147.36  1.18  38.12       24.67  -5.75      -1.06
+afternoon: BE at 14:00 if >= +0.5R        1962.0  141.29  1.16  39.50       23.29  -7.23      -1.06
+afternoon BE 13:00 + trail 0.5R at +1.5R  1962.0  110.12  1.14  42.00       20.80   1.43      -1.06
+afternoon: BE at 13:00 if >= +0.25R       1962.0  142.91  1.17  35.93       26.45  -9.38      -1.06
+
+===== R per year, both streams =====
+year                                      2021  2022  2023  2024  2025  2026
+rule                                                                        
+afternoon BE 13:00 + trail 0.5R at +1.5R  -3.0  36.2  32.0  32.3  11.2   1.4
+afternoon: BE at 13:00 if >= +0.25R        0.7  63.6  33.0  34.9  20.0  -9.4
+afternoon: BE at 13:00 if >= +0.5R         0.7  65.2  34.2  32.9  20.1  -5.8
+afternoon: BE at 14:00 if >= +0.5R        -0.4  63.4  32.8  33.5  19.3  -7.2
+live: fixed stop -> 15:55                 -0.9  61.8  30.8  32.0  18.4  -5.7

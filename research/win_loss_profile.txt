@@ -1,0 +1,39 @@
+WIN / LOSS PROFILE - do the wins make up for the losses?
+=======================================================
+research/win_loss_profile.py  (gold: research/mt5_bm_halfrisk.csv, the 2010-2026 real-EA export;
+nasdaq: the local tester export in the terminal's Common\Files\GoldBreakout)
+
+GOLD (2010-2026, live-equivalent): 2489 trades
+  win rate            39%   (972 wins / 1312 losses)
+  average win         +1.31R
+  average loss        -0.77R          <- only 34% of trades lose the full 1R, the rest are cut earlier
+  best / worst        +11.6R / -1.1R  <- the initial 2 ATR stop is the loss cap, wins are not capped
+  expectancy          +0.106R per trade  -> +265R total
+  payoff (avgW/|avgL|) 1.70  - needs a win rate of 37% to break even, we run at 39%
+  R percentiles       10% -1.00  25% -1.00  50% -0.10  75% +0.58  90% +1.84
+  trades >= +1R       18%  (they carry +1048R of +1271R of all wins)
+  trades >= +2R        9%  (they carry  +712R of +1271R)   - 56% of the profit from 9% of the trades
+  trades >= +3R        4%  (they carry  +446R of +1271R)   - 35% of the profit from 4% of the trades
+  trades >= +5R        1%  (they carry  +110R of +1271R)
+
+GOLD (last 12 months of it): 168 trades
+  win rate 54%   average win +1.27R   average loss -0.71R   expectancy +0.387R/trade (+65R)
+  best +4.7R   trades >= +1R 27%, >= +2R 13%, >= +3R 7%
+
+NASDAQ (tester export): 1664 trades
+  win rate 43%   average win +1.24R   average loss -0.73R   expectancy +0.123R/trade (+205R)
+  best +9.7R   trades >= +1R 23%, >= +2R 9%, >= +3R 3%
+
+Reading
+-------
+* Losses are clamped (2 ATR initial stop, no averaging down, worst trade -1.1R in 16 years) and
+  winners are not (best +11.6R).  A single +3R winner pays for four full -1R losses.
+* The profit is carried by a small tail: 4% of trades (>= +3R) produce 35% of all the wins,
+  9% produce 56%.  That is why every early "protection" rule (break-even / trailing / take-profit
+  variants) and every entry filter tested on this strategy reduced the total result.
+* The per-trade edge is thin (+0.11R) - it comes from volume and patience: ~150 gold trades/year,
+  a 6-loss streak happens roughly every 20 trades at a 39% win rate, and the 16-year maximum
+  drawdown was 24R.  A -1R day (like 2026-10-01) is the most common single outcome there is.
+* Money terms at the current settings: gold 1R ~ 0.53-0.63% in a BAD regime (half risk, ~$53-62 on
+  this account, exactly today's loss) and up to 1.25% (~$125) in a good regime; the last year's
+  best trade was +4.7R.

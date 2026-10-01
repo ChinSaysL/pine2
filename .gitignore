@@ -1,0 +1,12 @@
+# downloaded market data and generated research outputs (reproducible with the research/pull_*.py scripts)
+research/data/
+research/*.pkl
+research/*.csv
+research/tester_*.ini
+research/mq_symbols.txt
+research/brainstorm_out.txt
+research/*.log
+__pycache__/
+*.pyc
+# MetaEditor compile logs
+mt5/*.log

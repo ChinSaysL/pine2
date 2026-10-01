@@ -1,0 +1,5 @@
+# files that run or are read on the Linux VPS must keep LF line endings
+*.sh text eol=lf
+*.py text eol=lf
+*.set text eol=lf
+vps/README.md text eol=lf

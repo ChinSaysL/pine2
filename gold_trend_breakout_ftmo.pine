@@ -1,0 +1,382 @@
+//@version=5
+// Gold Trend Breakout [FTMO]
+//
+// A trend-following breakout for XAUUSD on the 1H chart (30m also works):
+//   1. Direction comes from the daily trend: longs only while yesterday's daily close is above
+//      its 50-day average, shorts only while it is below - and nothing while it is within 1%
+//      of the average, where the trend is ambiguous.
+//   2. Entry is a stop order at the break of the highest high (longs) / lowest low (shorts) of
+//      the last 24 hours.
+//   3. The initial stop sits 2 ATR from the entry; after that the stop trails 3 ATR behind the
+//      best price reached. Everything is closed before gold's 17:00 New York daily close.
+//   4. At +1R a second position is added and the whole trade's stop moves to breakeven, so a
+//      trend that keeps going pays about twice while the worst case stays one normal loss.
+// Designed on 2025 data (30m and 1H) and checked once on Jan - Sep 2026 without changes.
+// It does not work on 15m and below: the ATR stops sit inside the noise there.
+
+strategy("Gold Trend Breakout [FTMO]", "Gold BO", overlay = true, pyramiding = 2, initial_capital = 10000, default_qty_type = strategy.fixed, default_qty_value = 1, margin_long = 0, margin_short = 0, process_orders_on_close = true, calc_on_every_tick = false, commission_type = strategy.commission.cash_per_contract, commission_value = 0.15, max_labels_count = 500)
+
+// # ============================[INPUTS]============================ #
+
+groupSignal = "SIGNAL"
+
+chanHours = input.float(24, "Breakout Channel (hours)", minval = 4, step = 4, group = groupSignal, tooltip = "Entry on a break of the highest high / lowest low of this many hours. Measured in hours so it means the same on 30m and 1H. 24, 48 and 96 all held up in 2025 and in 2026; 24 made the most per month in both (1H: +39R in 2025, +25R in Jan - Sep 2026), which is what a time-limited challenge needs.")
+
+useTrend = input.bool(true, "Trade Only With The Daily Trend", group = groupSignal, tooltip = "Longs only while yesterday's daily close is above its daily average, shorts only while it is below. Uses the last closed daily bar, so it does not repaint.")
+
+trendDays = input.int(50, "Daily Trend Average (days)", minval = 5, group = groupSignal)
+
+emaFilter = input.bool(true, "Only On The Trend's Side Of The Daily EMA", inline = "ema", group = groupSignal, tooltip = "Longs only while yesterday's daily close is above its long-term daily EMA, shorts only while below. On 4 years of FTMO gold data (Sep 2022 - Sep 2026) this cut the worst drawdown from 35R to 24R and halved the chance of a challenge getting stuck at the loss limit when gold ranged (2022-23), for a few points less in the 2025-26 trend.")
+
+emaLen = input.int(200, "", minval = 20, inline = "ema", group = groupSignal)
+
+neutralBand = input.float(1.0, "Neutral Band (%)", minval = 0, maxval = 10, step = 0.25, group = groupSignal, tooltip = "No trades while yesterday's daily close is within this % of its daily average: the trend is ambiguous there and flips back and forth (September 2026 flipped 3 times). 0.5% to 1.5% all helped on both 1H and 30m and lowered the drawdown; 1.0% is the middle. 0 = off.")
+
+atrLen = input.int(14, "ATR Length", minval = 1, group = groupSignal)
+
+stopAtr = input.float(2.0, "Initial Stop (ATR)", minval = 0.25, step = 0.25, group = groupSignal, tooltip = "Distance from the entry trigger to the initial stop. 2 and 3 both held up.")
+
+trailAtr = input.float(3.0, "Trailing Stop (ATR)", minval = 0.5, step = 0.25, group = groupSignal, tooltip = "Once in a trade, the stop trails this many ATR behind the highest high (longs) / lowest low (shorts) since entry. It only ever tightens.")
+
+addAtR = input.float(1.0, "Add To Winner At (R)", minval = 0, step = 0.25, group = groupSignal, tooltip = "Once a trade is this many R in profit (R = entry to initial stop), a second position of the same risk is added and the stop of the whole trade moves to at least the first entry. The worst case for the trade stays one normal loss, while a trend that keeps going pays about twice. Tested on 1H and 30m: better in 7 of 7 quarters on both, and 0.75R, 1.5R and 1R+2R all helped too. 0 = off.")
+
+bufAtr = input.float(0.05, "Breakout Buffer (ATR)", minval = 0, step = 0.01, group = groupSignal, tooltip = "The entry stop order sits this far beyond the channel, so a bare touch does not fill.")
+
+groupRisk = "RISK"
+
+riskMode = input.string("Drawdown Scaled", "Risk Mode", ["Fixed", "Drawdown Scaled"], group = groupRisk, tooltip = "Fixed - every trade risks Risk Per Trade.\nDrawdown Scaled - every trade risks the room left before the Max Loss Limit divided by Losses To Limit, kept between Min and Max Risk. It shrinks automatically after losses, so a losing streak cannot run the account into the limit.")
+
+riskPercent = input.float(1.0, "Risk Per Trade (%)", minval = 0.05, maxval = 10, step = 0.05, group = groupRisk, tooltip = "Fixed mode. Share of the initial balance lost if the initial stop is hit.")
+
+maxRiskPct = input.float(1.25, "Scaled: Max Risk (%)", minval = 0.05, maxval = 5, step = 0.05, group = groupRisk, tooltip = "The most one trade may risk. 1.25% with the 5% / 2.5% loss guards kept every replayed challenge above -4.2% while still reaching +10% within 60 days about 60% of the time (74% within 90). 2% passes faster (72% within 60 days) but dipped to -6.8%.")
+
+riskDivisor = input.float(4, "Scaled: Losses To Limit", minval = 2, maxval = 30, step = 0.5, group = groupRisk, tooltip = "Risk per trade = room left before the Max Loss Limit / this value, capped at Max Risk. With a 5% limit and a 1.25% cap: 1.25% at the start, 0.75% after a -2% drawdown, 0.25% (the minimum) near the limit.")
+
+minRiskPct = input.float(0.25, "Scaled: Min Risk (%)", minval = 0.05, maxval = 5, step = 0.05, group = groupRisk)
+
+groupProp = "PROP FIRM RULES (FTMO)"
+
+propRules = input.bool(true, "Enforce Loss Limits", group = groupProp, tooltip = "Hard limits measured like FTMO: from the initial balance, with the day starting at midnight Prague time and open losses counted. A new trade is only opened when its full risk still fits under both limits, and everything is closed if a limit is reached.")
+
+dailyLimitPct = input.float(2.5, "Daily Loss Limit (%)", minval = 0.5, maxval = 20, step = 0.5, group = groupProp, tooltip = "FTMO's daily limit is 5% of the initial balance. 2.5% keeps a day's worst case at half of it: a trade is only opened if every open trade could hit its stop without passing this.")
+
+totalLimitPct = input.float(5.0, "Max Loss Limit (%)", minval = 1, maxval = 50, step = 0.5, group = groupProp, tooltip = "FTMO's maximum loss is 10% of the initial balance. 5% keeps the account's worst case at half of it: a trade is only opened if every open trade could hit its stop without passing this, and everything closes if it is reached. Replayed from every start day, the lowest point was -4.2%.")
+
+challengeMode = input.bool(false, "Challenge Mode", group = groupProp, tooltip = "Off (default) - the backtest trades the whole chart history, so the Strategy Tester shows the strategy's full record.\nOn - behaves like a live challenge: nothing is opened before Challenge Start, and once the Profit Target is reached with the minimum trading days met, the trade is closed and nothing new is opened. Turn this on, with Challenge Start set, for a real challenge.")
+
+profitTargetPct = input.float(10, "Profit Target (%)", minval = 0, maxval = 100, step = 0.5, group = groupProp, tooltip = "FTMO Challenge: 10%, Verification: 5%. Once reached with the minimum trading days met, the open trade is closed and nothing new is opened. 0 = off.")
+
+minTradingDays = input.int(4, "Min Trading Days", minval = 0, maxval = 30, group = groupProp, tooltip = "A day counts when a trade is opened on it (midnight Prague). If the target is reached earlier, trading continues at Risk After Target until the days are met.")
+
+postTargetRisk = input.float(0.1, "Risk After Target (%)", minval = 0.01, maxval = 5, step = 0.05, group = groupProp)
+
+challengeStart = input.time(timestamp("2020-01-01T00:00:00"), "Challenge Start", group = groupProp, tooltip = "Challenge Mode only. Set it to the day your challenge starts: no trade is opened before it, and the target and trading days are counted from it. Also useful to replay a challenge from any past date.")
+
+flatBeforeClose = input.bool(true, "Flat Before Daily And Weekend Close", group = groupProp, tooltip = "Closes any open trade on the last bar before gold's 17:00 New York daily and weekend close, and opens nothing on that bar.")
+
+newsFilter = input.bool(true, "Flat Around High-Impact News", group = groupProp, tooltip = "Closes any open trade and cancels entry orders before each event below, and opens nothing until after it.")
+
+newsBeforeMin = input.int(75, "Flat Minutes Before News", minval = 5, maxval = 240, group = groupProp, tooltip = "On 1H the last bar close before an 08:30 release is 08:00 and before a 14:00 decision is 13:00, so this needs to be over 60 there. 75 covers both.")
+
+newsAfterMin = input.int(15, "No Entries Minutes After News", minval = 3, maxval = 240, group = groupProp)
+
+newsList = input.text_area("2026-01-09 08:30\n2026-01-13 08:30\n2026-02-11 08:30\n2026-02-13 08:30\n2026-03-06 08:30\n2026-03-11 08:30\n2026-04-03 08:30\n2026-04-10 08:30\n2026-05-08 08:30\n2026-05-12 08:30\n2026-06-05 08:30\n2026-06-10 08:30\n2026-07-02 08:30\n2026-07-14 08:30\n2026-08-07 08:30\n2026-08-12 08:30\n2026-09-04 08:30\n2026-09-11 08:30\n2026-10-02 08:30\n2026-10-14 08:30\n2026-11-06 08:30\n2026-11-10 08:30\n2026-12-04 08:30\n2026-12-10 08:30\n2026-01-28 14:00\n2026-02-18 14:00\n2026-03-18 14:00\n2026-04-08 14:00\n2026-04-29 14:00\n2026-05-20 14:00\n2026-06-17 14:00\n2026-07-08 14:00\n2026-07-29 14:00\n2026-08-19 14:00\n2026-09-16 14:00\n2026-10-28 14:00\n2026-12-09 14:00", "News Events (New York time)", group = groupProp, tooltip = "One event per line as YYYY-MM-DD HH:MM in New York time. Pre-filled with the 2026 US jobs reports and CPI (08:30) and FOMC decisions and minutes (14:00). Add next year's dates when they are published.")
+
+groupView = "DISPLAY"
+
+showChannel = input.bool(true, "Show Breakout Channel", group = groupView)
+
+showDashboard = input.bool(true, "Dashboard", group = groupView)
+
+exportTrades = input.bool(false, "Export Trade List", group = groupView, tooltip = "Lists every closed trade as CSV in a table at the bottom left, including its result in R. For offline analysis only.")
+
+// # ============================[SIGNAL]============================ #
+
+atr = ta.atr(atrLen)
+
+tfMin = timeframe.in_seconds() / 60
+
+chanLen = math.max(int(math.round(chanHours * 60 / tfMin)), 2)
+
+// Channel including the current bar: the entry orders sent at this close work from the next bar.
+chanHigh = ta.highest(high, chanLen)
+
+chanLow = ta.lowest(low, chanLen)
+
+// Daily trend from the last closed daily bar ([1] with lookahead on is the non-repainting form).
+[dClose, dAvg, dEma] = request.security(syminfo.tickerid, "D", [close[1], ta.sma(close, trendDays)[1], ta.ema(close, emaLen)[1]], lookahead = barmerge.lookahead_on)
+
+float trendDistPct = na(dAvg) ? na : (dClose - dAvg) / dAvg * 100
+
+int trendRaw = na(trendDistPct) ? 0 : trendDistPct >= neutralBand and trendDistPct > 0 ? 1 : trendDistPct <= -neutralBand and trendDistPct < 0 ? -1 : 0
+
+// Only on the trend's side of the long-term daily EMA.
+bool emaBlocks = emaFilter and trendRaw != 0 and (na(dEma) or (trendRaw == 1 ? dClose < dEma : dClose > dEma))
+
+int trendDir = emaBlocks ? 0 : trendRaw
+
+bool longOk = useTrend ? trendDir == 1 : true
+
+bool shortOk = useTrend ? trendDir == -1 : true
+
+if timeframe.in_seconds() < 30 * 60 and barstate.islast
+    runtime.error("Gold Trend Breakout is built for the 30m or 1H chart. Its ATR stops sit inside the noise on lower timeframes and it lost money on 15m in testing.")
+
+// # ============================[PROP FIRM RULES]============================ #
+
+// News events, parsed once from the input list.
+var array<int> newsTimes = array.new<int>()
+if barstate.isfirst
+    for ln in str.split(newsList, "\n")
+        array<string> tok = array.new<string>()
+        for w in str.split(ln, " ")
+            if str.length(w) > 0
+                tok.push(w)
+        if tok.size() >= 2
+            array<string> dt = str.split(tok.get(0), "-")
+            array<string> hm = str.split(tok.get(1), ":")
+            if dt.size() == 3 and hm.size() == 2
+                float yy = str.tonumber(dt.get(0))
+                float mo = str.tonumber(dt.get(1))
+                float dd = str.tonumber(dt.get(2))
+                float hh = str.tonumber(hm.get(0))
+                float mi = str.tonumber(hm.get(1))
+                if not (na(yy) or na(mo) or na(dd) or na(hh) or na(mi))
+                    newsTimes.push(timestamp("America/New_York", int(yy), int(mo), int(dd), int(hh), int(mi)))
+
+// Decisions are taken at bar closes, so the tests use the close time.
+bool nearNews = false
+if newsFilter
+    for e in newsTimes
+        if e - time_close <= newsBeforeMin * 60000 and time_close - e <= newsAfterMin * 60000
+            nearNews := true
+
+// The last bar before the 17:00 New York break is the one whose close is past 16:45; no
+// entry order is left working into that bar either.
+int closeMinNY = hour(time_close, "America/New_York") * 60 + minute(time_close, "America/New_York")
+bool closingBar = flatBeforeClose and closeMinNY > 16 * 60 + 45 and closeMinNY <= 18 * 60
+int nextCloseMinNY = closeMinNY + int(tfMin)
+bool nextIsClosing = flatBeforeClose and nextCloseMinNY > 16 * 60 + 45 and nextCloseMinNY <= 18 * 60
+
+// FTMO counts from the initial balance and resets the day at midnight Prague time.
+var float dayStartEquity = strategy.initial_capital
+if ta.change(dayofmonth(time_close, "Europe/Prague")) != 0
+    dayStartEquity := math.max(nz(strategy.equity[1], strategy.initial_capital), strategy.initial_capital + nz(strategy.netprofit[1]))
+float dayLossPct   = (dayStartEquity - strategy.equity) / strategy.initial_capital * 100
+float totalLossPct = (strategy.initial_capital - strategy.equity) / strategy.initial_capital * 100
+bool  limitHit     = propRules and (dayLossPct >= dailyLimitPct or totalLossPct >= totalLimitPct)
+
+// Trading days: separate days (midnight Prague) on which a trade was opened.
+var int tradesSeen   = 0
+var int tradingDays  = 0
+var int lastTradeDay = na
+int pragueDay = year(time_close, "Europe/Prague") * 10000 + month(time_close, "Europe/Prague") * 100 + dayofmonth(time_close, "Europe/Prague")
+bool newTrade = strategy.closedtrades + strategy.opentrades > tradesSeen
+if newTrade
+    if na(lastTradeDay) or pragueDay != lastTradeDay
+        tradingDays  += 1
+        lastTradeDay := pragueDay
+
+// Profit target: once reached with the minimum trading days met, the challenge is passed.
+float gainPct  = -totalLossPct
+bool targetHit = propRules and challengeMode and profitTargetPct > 0 and gainPct >= profitTargetPct
+var bool passed = false
+var int  passedTime = na
+if targetHit and tradingDays >= minTradingDays and not passed
+    passed     := true
+    passedTime := time_close
+
+// Risk per trade in % of the initial balance.
+float roomPct = totalLimitPct - totalLossPct
+float riskNow = riskMode == "Fixed" ? riskPercent : math.max(math.min(maxRiskPct, roomPct / riskDivisor), minRiskPct)
+if targetHit
+    riskNow := math.min(riskNow, postTargetRisk)
+
+// # ============================[ORDERS]============================ #
+
+float stopDist = stopAtr * atr
+float longTrig  = chanHigh + bufAtr * atr
+float shortTrig = chanLow - bufAtr * atr
+
+// TradingView trades whole units; the size never goes below 1 unit.
+float qty          = na(stopDist) or stopDist <= 0 ? na : math.max(math.floor(strategy.initial_capital * riskNow / 100 / (stopDist * syminfo.pointvalue)), 1)
+float riskTakenPct = na(qty) ? na : qty * stopDist * syminfo.pointvalue / strategy.initial_capital * 100
+bool  riskFits     = not propRules or (not na(riskTakenPct) and dayLossPct + riskTakenPct <= dailyLimitPct and totalLossPct + riskTakenPct <= totalLimitPct)
+
+// A stop order without a price becomes a market order, so nothing is sent until the channel
+// and ATR exist (the first chanLen bars of history).
+bool levelsReady = not na(longTrig) and not na(shortTrig) and not na(stopDist)
+
+bool canEnter = levelsReady and (not challengeMode or time >= challengeStart) and not nearNews and not closingBar and not nextIsClosing and not limitHit and not passed and riskFits and not na(qty)
+
+// Stop of the orders that were working during this bar, remembered so a fill knows its stop.
+var float workLongStop  = na
+var float workShortStop = na
+
+// Trade state.
+var int   tradeDir   = 0
+var int   entryBar   = na
+var float tradeEntry = na
+var float tradeStop0 = na
+var float tradeStop  = na
+var float tradeExt   = na
+var bool  added      = false
+
+// Stops of every filled trade, by entry bar, for the export.
+var array<int>   stopBars   = array.new<int>()
+var array<float> stopPrices = array.new<float>()
+
+// A fill happened inside this bar (it may already have been stopped out again). While flat it is a
+// new trade; while in a trade it can only be the add to the winner.
+if newTrade and tradeDir != 0
+    added := true
+    float beStop = tradeDir == 1 ? math.max(tradeStop, tradeEntry) : math.min(tradeStop, tradeEntry)
+    stopBars.push(bar_index)
+    stopPrices.push(beStop)
+    tradesSeen := strategy.closedtrades + strategy.opentrades
+else if newTrade
+    bool  isOpen = strategy.opentrades > 0
+    float sz     = isOpen ? strategy.opentrades.size(strategy.opentrades - 1) : strategy.closedtrades.size(strategy.closedtrades - 1)
+    int   d    = sz > 0 ? 1 : -1
+    tradeEntry := isOpen ? strategy.opentrades.entry_price(strategy.opentrades - 1) : strategy.closedtrades.entry_price(strategy.closedtrades - 1)
+    tradeStop0 := d == 1 ? workLongStop : workShortStop
+    tradeStop  := tradeStop0
+    tradeDir   := isOpen ? d : 0
+    entryBar   := bar_index
+    tradeExt   := d == 1 ? high : low
+    added      := false
+    stopBars.push(bar_index)
+    stopPrices.push(tradeStop0)
+    tradesSeen := strategy.closedtrades + strategy.opentrades
+
+if tradeDir != 0 and strategy.position_size == 0
+    tradeDir := 0
+
+// Exits decided at this close: loss limit, profit target, news, the daily close.
+string exitReason = limitHit ? "Loss Limit" : passed ? "Target Reached" : nearNews ? "News" : closingBar ? "Market Close" : ""
+if tradeDir != 0 and exitReason != ""
+    strategy.close_all(comment = exitReason)
+    tradeDir := 0
+
+// Trailing stop: from the bar after the fill, the stop follows the best price reached.
+if tradeDir != 0
+    tradeExt := tradeDir == 1 ? math.max(tradeExt, high) : math.min(tradeExt, low)
+    if bar_index > entryBar
+        float trail = tradeDir == 1 ? tradeExt - trailAtr * atr : tradeExt + trailAtr * atr
+        tradeStop := tradeDir == 1 ? math.max(tradeStop, trail) : math.min(tradeStop, trail)
+    // Once the add has filled, the whole trade's stop is at least the first entry.
+    if added
+        tradeStop := tradeDir == 1 ? math.max(tradeStop, tradeEntry) : math.min(tradeStop, tradeEntry)
+    // Never send an exit without a stop price: that would remove the stop.
+    if na(tradeStop)
+        tradeStop := tradeDir == 1 ? tradeEntry - stopDist : tradeEntry + stopDist
+    string stopWhy = bar_index > entryBar and (tradeDir == 1 ? tradeStop > tradeStop0 : tradeStop < tradeStop0) ? "Trail" : "Stop"
+    strategy.exit(tradeDir == 1 ? "L Stop" : "S Stop", tradeDir == 1 ? "Long" : "Short", stop = tradeStop, comment = stopWhy)
+    if added
+        strategy.exit(tradeDir == 1 ? "LA Stop" : "SA Stop", tradeDir == 1 ? "Long Add" : "Short Add", stop = tradeStop, comment = stopWhy)
+
+// Add to the winner: a stop order at +addAtR R. Its own stop is the breakeven stop the whole trade
+// moves to when it fills, and it is sized for the normal risk over that distance.
+bool addWorking = false
+if tradeDir != 0 and not added and addAtR > 0
+    float r0      = math.abs(tradeEntry - tradeStop0)
+    float addLvl  = tradeEntry + tradeDir * addAtR * r0
+    float addStop = tradeDir == 1 ? math.max(tradeStop, tradeEntry) : math.min(tradeStop, tradeEntry)
+    float addDist = math.abs(addLvl - addStop)
+    float qtyAdd  = addDist > 0 ? math.max(math.floor(strategy.initial_capital * riskNow / 100 / (addDist * syminfo.pointvalue)), 1) : na
+    float addRisk = na(qtyAdd) ? na : qtyAdd * addDist * syminfo.pointvalue / strategy.initial_capital * 100
+    bool  addFits = not propRules or (not na(addRisk) and dayLossPct + addRisk <= dailyLimitPct and totalLossPct + addRisk <= totalLimitPct)
+    if not na(qtyAdd) and addFits and not nearNews and not closingBar and not nextIsClosing and not limitHit and not passed
+        strategy.entry(tradeDir == 1 ? "Long Add" : "Short Add", tradeDir == 1 ? strategy.long : strategy.short, qty = qtyAdd, stop = addLvl, comment = "Add")
+        strategy.exit(tradeDir == 1 ? "LA Stop" : "SA Stop", tradeDir == 1 ? "Long Add" : "Short Add", stop = addStop, comment = "Stop")
+        addWorking := true
+if not addWorking
+    strategy.cancel("Long Add")
+    strategy.cancel("Short Add")
+
+// Levels of the entry orders sent at this close, drawn on the next bar - the bar they work in.
+float sentLong  = na
+float sentShort = na
+
+// Entry orders for the next bar, only while flat.
+if tradeDir == 0 and canEnter and longOk
+    sentLong := longTrig
+    strategy.entry("Long", strategy.long, qty = qty, stop = longTrig, comment = "Buy")
+    strategy.exit("L Stop", "Long", stop = longTrig - stopDist, comment = "Stop")
+    workLongStop := longTrig - stopDist
+else
+    strategy.cancel("Long")
+    workLongStop := na
+
+if tradeDir == 0 and canEnter and shortOk
+    sentShort := shortTrig
+    strategy.entry("Short", strategy.short, qty = qty, stop = shortTrig, comment = "Sell")
+    strategy.exit("S Stop", "Short", stop = shortTrig + stopDist, comment = "Stop")
+    workShortStop := shortTrig + stopDist
+else
+    strategy.cancel("Short")
+    workShortStop := na
+
+// # ============================[DISPLAY]============================ #
+
+// The breakout level each bar had to cross: the order sent at the previous close. (Drawing the
+// live channel instead made every buy look like it filled below the line, because the channel
+// jumps up to the breakout bar's own high.)
+plot(showChannel ? sentLong[1] : na, "Buy Level", color.new(#26a69a, 0), 1, plot.style_linebr)
+plot(showChannel ? sentShort[1] : na, "Sell Level", color.new(#ef5350, 0), 1, plot.style_linebr)
+plot(tradeDir != 0 ? tradeStop : na, "Stop", color.new(#ffb300, 0), 2, plot.style_linebr)
+bgcolor(useTrend ? (trendDir == 1 ? color.new(#26a69a, 94) : trendDir == -1 ? color.new(#ef5350, 94) : na) : na, title = "Daily Trend")
+
+var table tb = table.new(position.bottom_right, 2, 7, bgcolor = #1e222d, border_color = #373a46, border_width = 1, frame_color = #373a46, frame_width = 1)
+if showDashboard and barstate.islast
+    tb.cell(0, 0, "Daily trend", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    tb.cell(1, 0, trendDir == 1 ? "Up - longs only" : trendDir == -1 ? "Down - shorts only" : emaBlocks ? "Against the " + str.tostring(emaLen) + " EMA - no trades" : na(trendDistPct) ? "n/a" : "Neutral - no trades (" + str.tostring(trendDistPct, "#.##") + "%)", text_color = trendDir == 1 ? #42bda8 : trendDir == -1 ? #ee787d : color.white, text_size = size.small)
+    tb.cell(0, 1, "Next risk", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    tb.cell(1, 1, na(riskTakenPct) ? "n/a" : str.tostring(riskTakenPct, "#.##") + "% (" + str.tostring(qty) + " units)", text_color = color.white, text_size = size.small)
+    tb.cell(0, 2, "Today", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    tb.cell(1, 2, str.tostring(-dayLossPct, "#.##") + "% / -" + str.tostring(dailyLimitPct, "#.#") + "%", text_color = dayLossPct > dailyLimitPct * 0.75 ? #ee787d : #42bda8, text_size = size.small)
+    tb.cell(0, 3, "Total", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    tb.cell(1, 3, str.tostring(gainPct, "#.##") + "% / -" + str.tostring(totalLimitPct, "#.#") + "%", text_color = totalLossPct > totalLimitPct * 0.75 ? #ee787d : #42bda8, text_size = size.small)
+    tb.cell(0, 4, "Target", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    tb.cell(1, 4, passed ? "✅ reached " + str.format_time(passedTime, "yyyy-MM-dd", "Europe/Prague") : not challengeMode ? "Challenge Mode off" : profitTargetPct <= 0 ? "off" : str.tostring(gainPct, "#.##") + "% / " + str.tostring(profitTargetPct, "#.#") + "%", text_color = passed ? #42bda8 : color.white, text_size = size.small)
+    tb.cell(0, 5, "Trading days", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    tb.cell(1, 5, str.tostring(tradingDays) + " / " + str.tostring(minTradingDays), text_color = tradingDays >= minTradingDays ? #42bda8 : color.white, text_size = size.small)
+    int lastNews = newsTimes.size() > 0 ? newsTimes.max() : na
+    tb.cell(0, 6, "News list", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    tb.cell(1, 6, not newsFilter ? "off" : na(lastNews) or lastNews < timenow ? "⚠ expired - add dates" : "ok", text_color = newsFilter and (na(lastNews) or lastNews < timenow) ? #ee787d : color.white, text_size = size.small)
+
+// Once the target is reached the strategy stops for good - right for a challenge, but it means
+// a chart replayed from an old Challenge Start opens nothing today. Said on the chart.
+var table stopBanner = table.new(position.top_center, 1, 1, bgcolor = #49343e, frame_color = #f23645, frame_width = 1)
+if barstate.islast
+    if passed
+        stopBanner.cell(0, 0, "⏹ Challenge Mode: the " + str.tostring(profitTargetPct, "#.#") + "% target was reached on " + str.format_time(passedTime, "yyyy-MM-dd", "Europe/Prague") + " (counted from Challenge Start), so nothing new is opened.\nFor a live challenge set Challenge Start to the day it begins; to see the full backtest turn Challenge Mode off.", text_color = color.white, text_size = size.normal)
+    else if limitHit and totalLossPct >= totalLimitPct
+        stopBanner.cell(0, 0, "⏹ Not trading: the " + str.tostring(totalLimitPct, "#.#") + "% max loss guard was reached.", text_color = color.white, text_size = size.normal)
+    else
+        stopBanner.clear(0, 0)
+
+// # ============================[TRADE EXPORT]============================ #
+
+var table exportTable = na
+if exportTrades and barstate.islast and strategy.closedtrades > 0
+    exportTable := table.new(position.bottom_left, 1, strategy.closedtrades + 1, bgcolor = #1e222d)
+    exportTable.cell(0, 0, "entry_time;exit_time;dir;entry;exit;qty;profit;risk_usd;r;comment", text_color = color.white, text_size = size.tiny)
+    int j = 0
+    for i = 0 to strategy.closedtrades - 1
+        int eb = strategy.closedtrades.entry_bar_index(i)
+        // Pine does not short-circuit here, so the bounds test cannot share the condition.
+        bool advance = true
+        while advance
+            advance := false
+            if j + 1 < stopBars.size()
+                if stopBars.get(j + 1) <= eb
+                    j += 1
+                    advance := true
+        float ep   = strategy.closedtrades.entry_price(i)
+        float sz   = strategy.closedtrades.size(i)
+        float stp  = stopBars.size() > 0 ? stopPrices.get(j) : na
+        float rUsd = math.abs(sz) * math.abs(ep - stp) * syminfo.pointvalue
+        float pnl  = strategy.closedtrades.profit(i)
+        string row = str.format_time(strategy.closedtrades.entry_time(i), "yyyy-MM-dd HH:mm", "UTC") + ";" + str.format_time(strategy.closedtrades.exit_time(i), "yyyy-MM-dd HH:mm", "UTC") + ";" + (sz > 0 ? "L" : "S") + ";" + str.tostring(ep, "0.###") + ";" + str.tostring(strategy.closedtrades.exit_price(i), "0.###") + ";" + str.tostring(math.abs(sz), "0.###") + ";" + str.tostring(pnl, "0.##") + ";" + str.tostring(rUsd, "0.##") + ";" + str.tostring(rUsd > 0 ? pnl / rUsd : na, "0.###") + ";" + strategy.closedtrades.exit_comment(i)
+        exportTable.cell(0, i + 1, row, text_color = color.white, text_size = size.tiny)

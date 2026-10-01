@@ -1,0 +1,22 @@
+daily data 2004-06-10 -> 2026-09-30 5740 bars
+trades with a daily ADX: 2489  2010-05-31 .. 2026-09-18
+
+R by the daily ADX at entry (the EA's InpAdxMin would skip everything below the threshold):
+   ADX    n     R  per_trade   PF win
+  0-15  198   7.2      0.036 1.08 35%
+ 15-18  187   2.2      0.012 1.03 37%
+ 18-20  216   4.7      0.022 1.06 41%
+ 20-22  184  16.3      0.089 1.20 37%
+ 22-25  251  -9.0     -0.036 0.91 35%
+25-100 1453 243.4      0.168 1.43 41%
+
+cumulative effect of a filter 'only take trades with ADX >= X':
+  ADX >=  0: keep 2489 trades  +264.8R   dropped    0 trades    +0.0R
+  ADX >= 15: keep 2291 trades  +257.6R   dropped  198 trades    +7.2R
+  ADX >= 18: keep 2104 trades  +255.4R   dropped  385 trades    +9.4R
+  ADX >= 19: keep 1997 trades  +248.1R   dropped  492 trades   +16.7R
+  ADX >= 20: keep 1888 trades  +250.7R   dropped  601 trades   +14.1R
+  ADX >= 22: keep 1704 trades  +234.4R   dropped  785 trades   +30.4R
+  ADX >= 25: keep 1453 trades  +243.4R   dropped 1036 trades   +21.4R
+
+today's trade (2026-10-01) ADX: 19.767582341829723 19.0063028389932
